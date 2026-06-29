@@ -13,6 +13,7 @@ services:
       - /etc/localtime:/etc/localtime:ro
       - /dev/input:/dev/input
       - /dev/bus/usb:/dev/bus/usb
+      - ${HOME}/CMU-VLN-Challenge-2026/autonomy_stack_mecanum_wheel_platform/src/base_autonomy/vehicle_simulator/mesh:/home/docker/autonomy_stack_mecanum_wheel_platform/src/base_autonomy/vehicle_simulator/mesh
     stdin_open: true
     tty: true
     deploy:
@@ -29,6 +30,17 @@ services:
       dockerfile: docker/Dockerfile
     container_name: iros2026_ai_module
     network_mode: host
+    user: "0:0"
+    entrypoint: ["/entrypoint.sh"]
+    environment:
+      - HOST_UID=1000
+      - HOST_GID=1000
+      - CMU_VLN_QUESTIONS_PATH=/home/docker/questions/questions.json
+    volumes:
+      - ${HOME}/vla3d_data:/home/docker/vla3d_data:ro
+      - ${HOME}/CMU-VLN-Challenge-2026/ai_module:/home/docker/ai_module
+      - ${HOME}/CMU-VLN-Challenge-2026/questions:/home/docker/questions:ro
+      - ${HOME}/CMU-VLN-Challenge-2026/docker/entrypoint_ai_module.sh:/entrypoint.sh:ro
     stdin_open: true
     tty: true
     deploy:
