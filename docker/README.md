@@ -65,28 +65,6 @@ This starts two containers:
 - `iros2026_system` — the base autonomy system (simulator + autonomy stack)
 - `iros2026_ai_module` — the AI module development environment with the updated `dummy_vlm` built in
 
-The `ai_module` container bind-mounts:
-- `~/vla3d_data` → `/home/docker/vla3d_data` (read-only scene data)
-- `~/CMU-VLN-Challenge-2026/ai_module` → `/home/docker/ai_module` (your code)
-- `~/CMU-VLN-Challenge-2026/questions` → `/home/docker/questions` (read-only `questions.json` for `publish_questions`)
-
-The `ai_module` entrypoint opens `/home/docker` for your UID and runs shells as `HOST_UID` (default 1000). **It does not chown bind mounts** — chown from inside Docker can remap files to UID `100999` on the host and break Cursor saves.
-
-If `ai_module` is owned by `100999` instead of your user, fix once on the host:
-```bash
-sudo chown -R $USER:$USER ~/CMU-VLN-Challenge-2026/ai_module
-```
-
-Recreate after compose changes:
-```bash
-docker compose -f compose_gpu.yml up -d --build --force-recreate ai_module
-```
-
-For extra shells, use the same UID as the entrypoint:
-```bash
-docker exec -u 1000:1000 -it iros2026_ai_module bash
-```
-
 ## Launch base autonomy system
 
 Access the system container.
