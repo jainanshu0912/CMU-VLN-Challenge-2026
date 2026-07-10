@@ -2,6 +2,7 @@
 
 import math
 import os
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -28,6 +29,7 @@ NUMERICAL_RESPONSE_TOPIC = "/numerical_response"
 
 DEFAULT_VLA3D_ROOT = os.path.expanduser("~/vla3d_data/Unity")
 ROS_QOS_DEPTH = 10
+DUPLICATE_QUESTION_WINDOW_SEC = 2.0
 
 # BEST_EFFORT sub receives from both BEST_EFFORT and RELIABLE publishers.
 QUESTION_QOS = QoSProfile(
@@ -85,6 +87,8 @@ class VlmPipelineNode(Node):
     self.vehicle_y = 0.0
     self._pose_received = False
     self._last_marker_object: SceneObject | None = None
+    self._last_question_text = ""
+    self._last_question_time = 0.0
 
     self._setup_ros_interfaces()
 
@@ -145,6 +149,20 @@ class VlmPipelineNode(Node):
     if not text:
       self.get_logger().warn(f"Empty message on {CHALLENGE_QUESTION_TOPIC}")
       return
+
+    now = time.monotonic()
+    if (
+      text == self._last_question_text
+      and (now - self._last_question_time) < DUPLICATE_QUESTION_WINDOW_SEC
+    ):
+      self.get_logger().warn(
+        f"Ignoring duplicate question on {CHALLENGE_QUESTION_TOPIC} "
+        f"(within {DUPLICATE_QUESTION_WINDOW_SEC:.0f}s)"
+      )
+      return
+
+    self._last_question_text = text
+    self._last_question_time = now
 
     preview = text if len(text) <= 100 else f"{text[:97]}..."
     self.get_logger().info(f"Received question on {CHALLENGE_QUESTION_TOPIC}: {preview}")

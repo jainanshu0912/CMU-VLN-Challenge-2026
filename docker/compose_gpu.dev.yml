@@ -1,0 +1,62 @@
+# Local dev overlay for Track A (vlm_pipeline).
+# Keeps compose_gpu.yml unchanged; use this file for bind mounts + host UID mapping.
+#
+# Usage (from docker/):
+#   docker compose -f compose_gpu.dev.yml up -d
+#   docker compose -f compose_gpu.dev.yml up -d --force-recreate ai_module
+#
+# Requires on host:
+#   ~/vla3d_data/Unity/<scene_name>/...
+#   ~/CMU-VLN-Challenge-2026/ai_module
+
+services:
+  system:
+    image: zhangjicmu/ubuntu24_ros:cmu_vla_challenge_simulation
+    container_name: iros2026_system
+    privileged: true
+    network_mode: host
+    environment:
+      - DISPLAY
+      - QT_X11_NO_MITSHM=1
+      - XAUTHORITY=/tmp/.docker.xauth
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /etc/localtime:/etc/localtime:ro
+      - /dev/input:/dev/input
+      - /dev/bus/usb:/dev/bus/usb
+      - ${HOME}/CMU-VLN-Challenge-2026/autonomy_stack_mecanum_wheel_platform/src/base_autonomy/vehicle_simulator/mesh:/home/docker/autonomy_stack_mecanum_wheel_platform/src/base_autonomy/vehicle_simulator/mesh
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ai_module:
+    build:
+      context: ../ai_module
+      dockerfile: docker/Dockerfile
+    container_name: iros2026_ai_module
+    network_mode: host
+    user: "0:0"
+    entrypoint: ["/entrypoint.sh"]
+    environment:
+      - HOST_UID=1000
+      - HOST_GID=1000
+    volumes:
+      - ${HOME}/vla3d_data:/home/docker/vla3d_data:ro
+      - ${HOME}/CMU-VLN-Challenge-2026/ai_module:/home/docker/ai_module
+      - ${HOME}/CMU-VLN-Challenge-2026/docker/entrypoint_ai_module.sh:/entrypoint.sh:ro
+      - ${HOME}/groundingdino_models:/home/docker/models:ro
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

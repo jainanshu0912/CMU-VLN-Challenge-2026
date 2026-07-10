@@ -14,7 +14,7 @@ setup(
         (share_dir, ["package.xml"]),
         (
           os.path.join(share_dir, "launch"),
-          ["launch/vlm_pipeline.launch.py", "launch/publish_questions.launch.py"],
+          ["launch/vlm_pipeline.launch.py"],
         ),
     ],
     install_requires=["setuptools"],
@@ -27,7 +27,6 @@ setup(
     entry_points={
         "console_scripts": [
             "vlm_pipeline_node = vlm_pipeline.main_node:main",
-            "publish_questions = vlm_pipeline.publish_questions:main",
         ],
     },
 )
