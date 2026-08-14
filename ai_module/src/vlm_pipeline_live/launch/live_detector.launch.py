@@ -18,6 +18,11 @@ def generate_launch_description():
   box_threshold_arg = DeclareLaunchArgument("box_threshold", default_value="0.3")
   text_threshold_arg = DeclareLaunchArgument("text_threshold", default_value="0.25")
   force_cpu_arg = DeclareLaunchArgument("force_cpu", default_value="false")
+  device_arg = DeclareLaunchArgument(
+    "device",
+    default_value="",
+    description='Empty = auto (cuda if available). Examples: "cuda", "cuda:0", "cpu"',
+  )
 
   detector_node = Node(
     package="vlm_pipeline_live",
@@ -30,6 +35,7 @@ def generate_launch_description():
       "box_threshold": LaunchConfiguration("box_threshold"),
       "text_threshold": LaunchConfiguration("text_threshold"),
       "force_cpu": LaunchConfiguration("force_cpu"),
+      "device": LaunchConfiguration("device"),
       "auto_run_on_exploration_complete": True,
       "shutdown_on_complete": False,
     }],
@@ -41,5 +47,6 @@ def generate_launch_description():
     box_threshold_arg,
     text_threshold_arg,
     force_cpu_arg,
+    device_arg,
     detector_node,
   ])

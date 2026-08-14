@@ -8,7 +8,7 @@ Separate ROS 2 package from Track A (`vlm_pipeline`). Builds a live scene repres
 |--------|--------|
 | `explorer.py` | Rotate-in-place exploration (4 views) |
 | `scan_stability.py` | Registered scan stabilisation gate |
-| `live_scene_graph.py` | Not started |
+| `live_scene_graph.py` | VLA-3D-style relations → `SceneData` / scene_graph.json |
 | `live_detector.py` | GroundingDINO + LiDAR fusion → 3D boxes |
 | `equirect_to_perspective.py` | 360° → 4×90° perspective crops + ray maps |
 
@@ -162,128 +162,144 @@ vlm_pipeline_live/
 ├── launch/
 │   ├── explorer.launch.py
 │   ├── live_detector.launch.py
+│   ├── pipeline_b.launch.py
 │   ├── pipeline_b_cpu.launch.py
-│   └── pipeline_b_manual_cpu.launch.py
+│   ├── pipeline_b_manual.launch.py
+│   ├── pipeline_b_manual_cpu.launch.py
+│   └── live_scene_graph.launch.py
 └── vlm_pipeline_live/
     ├── explorer.py
     ├── scan_stability.py
     ├── equirect_to_perspective.py
     ├── grounding_dino_backend.py
     ├── lidar_camera_fusion.py
-    └── live_detector.py
+    ├── live_detector.py
+    ├── live_scene_graph.py
+    └── live_scene_graph_node.py
 ```
 
-Integration with Pipeline A (`GraphSearchMatcher`, `main_node`) is planned after `live_scene_graph.py` exists.
+## Live scene graph
 
-## Manual teleop mapping (recommended for now)
+`live_scene_graph.py` converts fused 3D detections into a **VLA-3D / IRef-VLA** scene graph (same JSON schema as `*_scene_graph.json`) and a Pipeline A `SceneData` object that `GraphSearchMatcher` / `CountPipeline` can consume.
 
-Auto exploration is disabled while waypoint navigation is being tuned. Use **teleop** to drive the robot, then trigger detection at each stop.
+Heuristics follow [VLA-3D `scene_graph/generate_scene_info.py`](https://github.com/HaochenZ11/VLA-3D/tree/main/scene_graph) (above/below/on/in/near/closest/farthest/between/hanging_on), with **absolute** near distance (default 1.5 m) matching Pipeline A's geometric fallback.
+
+### Relations
+
+| Relation | Rule (AABB) |
+|----------|-------------|
+| `above` / `below` | XY IOM ≥ 0.5 and vertical separation |
+| `on` | Contact gap ≤ 15 cm + XY IOM ≥ 0.5 + larger support footprint |
+| `in` | Target center inside container + smaller size (container-like labels) |
+| `near` | XY center distance < 1.5 m |
+| `beside` | Near and not stacked |
+| `closest` / `farthest` | Per-class distance ranking (VLA-3D schema) |
+| `between` | Target projects onto segment between two anchors (perp ≤ 0.5 m) |
+| `hanging_on` | Elevated near anchor, not already on/in something |
+
+### Offline / library usage
+
+```python
+from vlm_pipeline_live.live_scene_graph import LiveSceneGraphBuilder
+from vlm_pipeline.graph_search import GraphSearchMatcher
+
+result = LiveSceneGraphBuilder(scene_name="live_scene").build_from_detections(detections)
+scene = result.scene  # vlm_pipeline.scene_loader.SceneData
+matcher = GraphSearchMatcher()
+# matcher.find(scene, parsed_query)
+```
+
+### ROS
+
+After `/vlm_live/detection_complete`, the scene-graph node publishes:
+
+| Topic | Type |
+|-------|------|
+| `/vlm_live/scene_graph_json` | `std_msgs/String` (VLA-3D JSON) |
+| `/vlm_live/scene_graph_complete` | `std_msgs/Bool` |
+
+Also writes `/tmp/vlm_live_scene_graph.json` by default.
+
+```bash
+ros2 launch vlm_pipeline_live live_scene_graph.launch.py
+# or included in pipeline_b_manual_cpu.launch.py
+```
+
+### Unit test
+
+```bash
+cd ai_module/src/vlm_pipeline_live
+PYTHONPATH=../vlm_pipeline:$PYTHONPATH python3 -m unittest tests.test_live_scene_graph
+```
+
+Integration with Pipeline A (`main_node` `scene_mode:=live`) is the next step after you have live graphs from teleop mapping.
+
+## Manual teleop mapping (recommended — GPU)
+
+Use this on a machine with NVIDIA GPU + CUDA torch. Teleop the robot, then trigger detection.
 
 ### Build
 
 ```bash
 cd /home/docker/ai_module
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select vlm_pipeline_live
+colcon build --packages-select vlm_pipeline vlm_pipeline_live
 source install/setup.bash
+```
+
+### Verify GPU inside the AI container
+
+```bash
+python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no gpu')"
 ```
 
 ### Run
 
-Terminal 1 — sim + autonomy (teleop / smart joystick in RViz as usual).
-
-Terminal 2 — live detector only (CPU):
-
 ```bash
-ros2 launch vlm_pipeline_live pipeline_b_manual_cpu.launch.py
+ros2 launch vlm_pipeline_live pipeline_b_manual.launch.py
+# optional: device:=cuda:0
+# CPU fallback: pipeline_b_manual_cpu.launch.py
 ```
 
 ### Workflow
 
-1. Drive the robot with RViz teleop or joystick to a viewpoint.
-2. Let `/registered_scan` and `/camera/image` update for a second or two.
-3. Trigger detection (CPU: expect ~2–5 min for 4 crops):
+1. Drive the robot with RViz teleop / smart joystick to a viewpoint.
+2. Let `/registered_scan` and `/camera/image` update briefly.
+3. Trigger detection (GPU: typically seconds–tens of seconds for 4 crops):
 
 ```bash
 ros2 topic pub --once /vlm_live/run_detection std_msgs/msg/Bool "{data: true}"
 ```
 
-4. Repeat from new viewpoints — detections **accumulate** in the map (3D NMS merge).
-5. View fused boxes in RViz: **MarkerArray** on `/vlm_live/detection_markers`, frame **map**.
-6. Read JSON map: `ros2 topic echo /vlm_live/detections_json --once`
+4. Scene-graph node builds relations after `/vlm_live/detection_complete` → `/vlm_live/scene_graph_json` (+ `/tmp/vlm_live_scene_graph.json`).
+5. Move to new viewpoints and re-trigger (detections accumulate; graph rebuilds).
+6. RViz: MarkerArray on `/vlm_live/detection_markers`, frame `map`.
 
-Snapshots (equirect PNG + pose + detections JSON) save to `/tmp/vlm_live_snapshots/` by default.
-
-Clear the accumulated map:
-
-```bash
-ros2 topic pub --once /vlm_live/clear_detections std_msgs/msg/Bool "{data: true}"
-```
+Expect log: `GroundingDINO backend available | device=cuda`
 
 ### Manual-mode topics
 
 | Topic | Type | Role |
 |-------|------|------|
-| `/vlm_live/run_detection` | `std_msgs/Bool` | Run GroundingDINO + fusion on latest sensors |
+| `/vlm_live/run_detection` | `std_msgs/Bool` | Run GroundingDINO + fusion |
 | `/vlm_live/clear_detections` | `std_msgs/Bool` | Reset accumulated map |
-| `/vlm_live/detections_json` | `std_msgs/String` | Merged 3D object list |
-| `/vlm_live/detection_markers` | `visualization_msgs/MarkerArray` | RViz debug |
+| `/vlm_live/detections_json` | `std_msgs/String` | Merged 3D objects |
+| `/vlm_live/detection_markers` | `visualization_msgs/MarkerArray` | RViz boxes |
+| `/vlm_live/scene_graph_json` | `std_msgs/String` | VLA-3D scene graph |
+| `/vlm_live/scene_graph_complete` | `std_msgs/Bool` | Graph ready |
 
-## CPU test (auto exploration — optional)
-
-Use this while Docker GPU passthrough is broken. GroundingDINO runs on CPU (slow: ~2–5 min for 4 crops on first run).
-
-### Prerequisites (inside `iros2026_ai_module`)
+## CPU fallback
 
 ```bash
-python3 -c "import torch, groundingdino; print('ok', torch.cuda.is_available())"
-ls /home/docker/models/GroundingDINO_SwinT_OGC.py /home/docker/models/groundingdino_swint_ogc.pth
-```
-
-**Transformers version:** GroundingDINO expects the transformers 4.x BERT API. If you see  
-`AttributeError: 'BertModel' object has no attribute 'get_head_mask'`, either rebuild after pulling the latest `vlm_pipeline_live` (includes a runtime patch), or pin:
-
-```bash
-pip install --break-system-packages 'transformers>=4.37,<5'
-```
-
-### Build
-
-```bash
-cd /home/docker/ai_module
-source /opt/ros/jazzy/setup.bash
-colcon build --packages-select vlm_pipeline_live
-source install/setup.bash
-```
-
-### Run (sim must be up, RViz in waypoint mode)
-
-One launch starts **explorer + detector** (`force_cpu:=true`, shorter prompt):
-
-```bash
+ros2 launch vlm_pipeline_live pipeline_b_manual_cpu.launch.py
+# or explorer+detector:
 ros2 launch vlm_pipeline_live pipeline_b_cpu.launch.py
 ```
 
-Expected sequence:
+Pin transformers if needed: `pip install --break-system-packages 'transformers>=4.37,<5'`
 
-1. ~60–120 s exploration (4 standoff waypoints + 6 s settle each)
-2. `Exploration complete` on `/vlm_live/exploration_complete`
-3. `Starting live detection...` then per-crop timing logs
-4. `Published N fused 3D detections` on `/vlm_live/detections_json`
-
-### Verify
+GPU explorer path (once waypoints work):
 
 ```bash
-ros2 topic echo /vlm_live/exploration_complete --once
-ros2 topic echo /vlm_live/detection_complete --once
-ros2 topic echo /vlm_live/detections_json --once
-```
-
-In RViz: add **MarkerArray** on `/vlm_live/detection_markers`, fixed frame **map**.
-
-### Separate terminals (optional)
-
-```bash
-ros2 launch vlm_pipeline_live live_detector.launch.py force_cpu:=true
-ros2 launch vlm_pipeline_live explorer.launch.py
+ros2 launch vlm_pipeline_live pipeline_b.launch.py
 ```

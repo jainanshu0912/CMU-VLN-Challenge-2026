@@ -178,22 +178,31 @@ class GroundingDinoBackend:
         "model_config_path and model_checkpoint_path parameters."
       )
 
-    import sys
     print(
       f"[GroundingDINO] Loading weights from {self.checkpoint_path} on {self.device} "
-      "(first run may take 1–3 min)...",
+      f"(cuda_available={torch.cuda.is_available()})...",
       flush=True,
     )
+    if self.device.startswith("cuda") and torch.cuda.is_available():
+      print(
+        f"[GroundingDINO] GPU: {torch.cuda.get_device_name(0)} "
+        f"| {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB",
+        flush=True,
+      )
 
     _patch_groundingdino_transformers_compat()
 
     from groundingdino.util.inference import load_model
 
-    model = load_model(self.config_path, self.checkpoint_path)
-    if self.device != "cpu":
-      model = model.to(self.device)
+    # Official API defaults to device="cuda"; pass our resolved device explicitly.
+    try:
+      model = load_model(self.config_path, self.checkpoint_path, device=self.device)
+    except TypeError:
+      model = load_model(self.config_path, self.checkpoint_path)
+    model = model.to(self.device)
+    model.eval()
     self._model = model
-    print("[GroundingDINO] Model loaded.", flush=True)
+    print(f"[GroundingDINO] Model loaded on {self.device}.", flush=True)
     return self._model
 
   def detect(
@@ -211,18 +220,40 @@ class GroundingDinoBackend:
 
     model = self._load_model()
     image_tensor = self._preprocess(image_rgb).to(self.device)
+    timing_hint = (
+      "GPU: typically a few seconds per crop"
+      if self.device.startswith("cuda")
+      else "CPU: often 2–8 min per crop"
+    )
     print(
-      f"[GroundingDINO] Running inference heading={heading_deg:.0f}° on {self.device} "
-      f"(CPU: often 2–8 min per crop)...",
+      f"[GroundingDINO] Inference heading={heading_deg:.0f}° on {self.device} "
+      f"({timing_hint})...",
       flush=True,
     )
-    boxes, logits, phrases = predict(
-      model=model,
-      image=image_tensor,
-      caption=prompt,
-      box_threshold=self.box_threshold,
-      text_threshold=self.text_threshold,
-    )
+
+    with torch.inference_mode():
+      try:
+        boxes, logits, phrases = predict(
+          model=model,
+          image=image_tensor,
+          caption=prompt,
+          box_threshold=self.box_threshold,
+          text_threshold=self.text_threshold,
+          device=self.device,
+        )
+      except TypeError:
+        # Older GroundingDINO builds without a device= argument.
+        model = model.to(self.device)
+        boxes, logits, phrases = predict(
+          model=model,
+          image=image_tensor,
+          caption=prompt,
+          box_threshold=self.box_threshold,
+          text_threshold=self.text_threshold,
+        )
+
+    if self.device.startswith("cuda") and torch.cuda.is_available():
+      torch.cuda.empty_cache()
 
     height, width = image_rgb.shape[:2]
     detections: list[Detection2D] = []
@@ -259,7 +290,7 @@ class GroundingDinoBackend:
     transform = T.Compose([
       T.RandomResize([800], max_size=1333),
       T.ToTensor(),
-      T.Normalize([0.485, 0.456, 0.406], [0.485, 0.456, 0.406]),
+      T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
     image_pil = Image.fromarray(image_rgb)
     image_tensor, _ = transform(image_pil, None)

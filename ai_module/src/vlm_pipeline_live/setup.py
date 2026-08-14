@@ -15,7 +15,10 @@ setup(
     (os.path.join(share_dir, "launch"), [
       "launch/explorer.launch.py",
       "launch/live_detector.launch.py",
+      "launch/live_scene_graph.launch.py",
+      "launch/pipeline_b.launch.py",
       "launch/pipeline_b_cpu.launch.py",
+      "launch/pipeline_b_manual.launch.py",
       "launch/pipeline_b_manual_cpu.launch.py",
     ]),
   ],
@@ -30,6 +33,7 @@ setup(
     "console_scripts": [
       "explorer_node = vlm_pipeline_live.explorer:main",
       "live_detector_node = vlm_pipeline_live.live_detector:main",
+      "live_scene_graph_node = vlm_pipeline_live.live_scene_graph_node:main",
     ],
   },
 )

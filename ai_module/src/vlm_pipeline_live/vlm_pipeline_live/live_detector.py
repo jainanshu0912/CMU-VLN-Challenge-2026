@@ -183,6 +183,7 @@ class LiveDetectorNode(Node):
     self.declare_parameter("snapshot_dir", "/tmp/vlm_live_snapshots")
     self.declare_parameter("shutdown_on_complete", False)
     self.declare_parameter("force_cpu", False)
+    self.declare_parameter("device", "")  # "" = auto (cuda if available), or "cuda" / "cpu"
 
     config_path = self.get_parameter("model_config_path").get_parameter_value().string_value
     checkpoint_path = (
@@ -190,12 +191,14 @@ class LiveDetectorNode(Node):
     )
     default_prompt = self.get_parameter("detection_prompt").get_parameter_value().string_value
     force_cpu = self.get_parameter("force_cpu").get_parameter_value().bool_value
+    device_override = self.get_parameter("device").get_parameter_value().string_value.strip()
 
     detector = GroundingDinoBackend(
       config_path=config_path,
       checkpoint_path=checkpoint_path,
       box_threshold=self.get_parameter("box_threshold").get_parameter_value().double_value,
       text_threshold=self.get_parameter("text_threshold").get_parameter_value().double_value,
+      device=device_override,
       force_cpu=force_cpu,
     )
     projector = EquirectPerspectiveProjector()
@@ -275,9 +278,14 @@ class LiveDetectorNode(Node):
       self.get_logger().info(
         f"GroundingDINO backend available | device={detector.device}"
       )
-      if detector.device == "cpu":
+      if detector.device.startswith("cuda"):
+        self.get_logger().info(
+          "Running on GPU — expect roughly a few seconds per crop after model load."
+        )
+      else:
         self.get_logger().warn(
-          "Running on CPU — first detection may take several minutes for 4 crops."
+          "Running on CPU — first detection may take several minutes for 4 crops. "
+          "Pass force_cpu:=false and ensure CUDA torch is installed for GPU."
         )
     else:
       self.get_logger().warn(
