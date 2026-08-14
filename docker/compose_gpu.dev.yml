@@ -15,15 +15,31 @@ services:
     container_name: iros2026_system
     privileged: true
     network_mode: host
+    # Share host IPC + /dev/shm so FastDDS can deliver topics to ai_module.
+    # Without this, topic list works but /state_estimation hz/echo fails in AI.
+    ipc: host
     environment:
       - DISPLAY
       - QT_X11_NO_MITSHM=1
       - XAUTHORITY=/tmp/.docker.xauth
+      - ROS_DOMAIN_ID=0
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/fastdds_udp.xml
+      - RMW_FASTRTPS_USE_QOS_FROM_XML=1
+      # Hybrid laptops: Unity must use NVIDIA GL, not AMD Mesa (else camera/lidar
+      # encode fails → NullReferenceException → ROS-TCP reconnect loop → black RViz).
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - __NV_PRIME_RENDER_OFFLOAD=1
+      - __GLX_VENDOR_LIBRARY_NAME=nvidia
+      - __VK_LAYER_NV_optimus=NVIDIA_only
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - /etc/localtime:/etc/localtime:ro
       - /dev/input:/dev/input
       - /dev/bus/usb:/dev/bus/usb
+      - /dev/shm:/dev/shm
+      - ${HOME}/CMU-VLN-Challenge-2026/docker/fastdds_udp.xml:/fastdds_udp.xml:ro
       - ${HOME}/CMU-VLN-Challenge-2026/autonomy_stack_mecanum_wheel_platform/src/base_autonomy/vehicle_simulator/mesh:/home/docker/autonomy_stack_mecanum_wheel_platform/src/base_autonomy/vehicle_simulator/mesh
     stdin_open: true
     tty: true
@@ -41,12 +57,20 @@ services:
       dockerfile: docker/Dockerfile
     container_name: iros2026_ai_module
     network_mode: host
+    ipc: host
     user: "0:0"
     entrypoint: ["/entrypoint.sh"]
     environment:
       - HOST_UID=1000
       - HOST_GID=1000
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+      - ROS_DOMAIN_ID=0
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/fastdds_udp.xml
+      - RMW_FASTRTPS_USE_QOS_FROM_XML=1
     volumes:
+      - /dev/shm:/dev/shm
+      - ${HOME}/CMU-VLN-Challenge-2026/docker/fastdds_udp.xml:/fastdds_udp.xml:ro
       - ${HOME}/vla3d_data:/home/docker/vla3d_data:ro
       - ${HOME}/CMU-VLN-Challenge-2026/ai_module:/home/docker/ai_module
       - ${HOME}/CMU-VLN-Challenge-2026/docker/entrypoint_ai_module.sh:/entrypoint.sh:ro
