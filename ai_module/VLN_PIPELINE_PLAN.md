@@ -312,7 +312,7 @@ The live pipeline applies to the real-robot stage with these tuning adjustments:
 
 ### When it applies
 
-Pipeline C is a drop-in upgrade to the reasoning layer of Pipelines A and B. The scene data source (VLA-3D static vs. live detected) stays the same. Only the query parsing and matching steps change.
+Pipeline C is an **independent** reasoning package (`vlm_pipeline_sort3d`). Scene data can come from VLA-3D CSVs (offline) or, later, any external object list. It is intentionally **not** wired into A/B so we can A/B-test accuracy without shared failure modes. If it wins, we can adopt it as the default reasoner.
 
 ### Architecture
 
@@ -432,14 +432,19 @@ For Track A (static scenes): use VLA-3D `raw_label` + `color_scheme` label as si
 
 ### Components to Build
 
+> **Independent package:** `ai_module/src/vlm_pipeline_sort3d/` (same pattern as Pipeline B’s `vlm_pipeline_live`). No ROS dependency on A/B — compare accuracy side-by-side without coupling code.
 
-| File                         | Status        | Description                                                       |
-| ---------------------------- | ------------- | ----------------------------------------------------------------- |
-| `sort3d/spatial_toolbox.py`  | ❌ Not started | Standalone geometry functions (refactored from `graph_search.py`) |
-| `sort3d/toolbox_reasoner.py` | ❌ Not started | LLM chain-of-thought with tool execution loop                     |
-| `sort3d/object_filter.py`    | ❌ Not started | LLM call #1: extract nouns, filter relevant objects               |
-| `sort3d/object_captioner.py` | ❌ Not started | Qwen2-VL crop captioner (Track B / real robot only)               |
-| `main_node.py` (update)      | ❌ Pending     | Add `reasoning_mode` param (`pipeline_a` vs `sort3d`)             |
+
+| File                                      | Status           | Description                                             |
+| ----------------------------------------- | ---------------- | ------------------------------------------------------- |
+| `vlm_pipeline_sort3d/scene_inventory.py`  | ✅ Done (v0)      | Own VLA-3D CSV → object inventory (no SceneData import) |
+| `vlm_pipeline_sort3d/spatial_toolbox.py`  | ✅ Done (v0)      | Standalone geometry tools                               |
+| `vlm_pipeline_sort3d/object_filter.py`    | ✅ Done (v0)      | Noun extract + relevance filter (rule / optional LLM)   |
+| `vlm_pipeline_sort3d/toolbox_reasoner.py` | ✅ Done (v0)      | LLM chain-of-thought + tool execution loop              |
+| `vlm_pipeline_sort3d/object_captioner.py` | 🟡 Stub          | Qwen2-VL crop captioner hook (Track B / real robot)     |
+| `vlm_pipeline_sort3d/main_node.py`        | 🟡 ROS I/O wired | LLM backend wiring still TODO                           |
+| LLM backend (in-package)                  | ❌ Not started    | Thin client (do not import `vlm_pipeline` backends)     |
+| Offline A-vs-C benchmark                  | ❌ Not started    | All 45 find+count questions                             |
 
 
 ---
@@ -447,15 +452,15 @@ For Track A (static scenes): use VLA-3D `raw_label` + `color_scheme` label as si
 ## 7. Pipeline Comparison Summary
 
 
-|                     | Pipeline A                 | Pipeline B                           | Pipeline C                                |
-| ------------------- | -------------------------- | ------------------------------------ | ----------------------------------------- |
-| Scene data source   | VLA-3D static (pre-loaded) | Live sensors (GroundingDINO + LiDAR) | Either (same reasoning layer)             |
-| Query understanding | Rule-based + LLM JSON      | Same as A                            | LLM chain-of-thought + toolbox            |
-| Object attributes   | VLA-3D color scheme        | LiDAR cluster extent                 | VLM captions (richer)                     |
-| Spatial reasoning   | Graph search (single-pass) | Online graph                         | Sequential toolbox calls (chainable)      |
-| Answer latency      | ~2–5 s                     | ~90 s explore + ~5 s answer          | ~3–8 s (extra LLM filter call)            |
-| Applies to          | 15 training scenes         | 3 test scenes + real robot           | All scenes (replaces A/B reasoning layer) |
-| Status              | **Largely complete**       | Not started                          | Not started                               |
+|                     | Pipeline A                 | Pipeline B                           | Pipeline C                             |
+| ------------------- | -------------------------- | ------------------------------------ | -------------------------------------- |
+| Scene data source   | VLA-3D static (pre-loaded) | Live sensors (GroundingDINO + LiDAR) | Either (same reasoning layer)          |
+| Query understanding | Rule-based + LLM JSON      | Same as A                            | LLM chain-of-thought + toolbox         |
+| Object attributes   | VLA-3D color scheme        | LiDAR cluster extent                 | VLM captions (richer)                  |
+| Spatial reasoning   | Graph search (single-pass) | Online graph                         | Sequential toolbox calls (chainable)   |
+| Answer latency      | ~2–5 s                     | ~90 s explore + ~5 s answer          | ~3–8 s (extra LLM filter call)         |
+| Applies to          | 15 training scenes         | 3 test scenes + real robot           | All scenes (independent package)       |
+| Status              | **Largely complete**       | In progress (`vlm_pipeline_live`)    | **Scaffolded** (`vlm_pipeline_sort3d`) |
 
 
 ---
@@ -503,19 +508,28 @@ ai_module/src/vlm_pipeline/
 │       ├── live_detector.py            ❌ GroundingDINO + LiDAR-Camera fusion
 │       └── live_scene_graph.py         ❌ 3D bboxes → SceneData
 │
-│   ├── # ── PIPELINE C (SORT3D) ────────────────────────────────────────────
-│   └── sort3d/
-│       ├── __init__.py                 ❌
-│       ├── spatial_toolbox.py          ❌ Standalone geometry functions
-│       ├── toolbox_reasoner.py         ❌ LLM tool-calling loop
-│       ├── object_filter.py            ❌ LLM noun extraction + relevance filter
-│       └── object_captioner.py         ❌ Qwen2-VL crop captioner
-│
 └── tests/
-    ├── test_offline_find.py            ❌ All 30 find questions offline
-    ├── test_offline_count.py           ❌ All 15 count questions offline
-    ├── test_live_smoke.py              ❌ Pipeline B on chinese_room w/o VLA-3D data
-    └── test_sort3d_reasoning.py        ❌ Pipeline C on all 45 questions
+    ├── test_offline_find.py            ✅ All 30 find questions offline
+    └── test_offline_count.py           ✅ All 15 count questions offline
+
+ai_module/src/vlm_pipeline_live/          ← PIPELINE B (independent package)
+└── (see that package’s README)
+
+ai_module/src/vlm_pipeline_sort3d/        ← PIPELINE C (independent package)
+├── package.xml / setup.py / setup.cfg
+├── README.md
+├── launch/pipeline_c.launch.py
+├── config/pipeline_c.yaml
+├── vlm_pipeline_sort3d/
+│   ├── scene_inventory.py              ✅ VLA-3D CSV → inventory
+│   ├── spatial_toolbox.py              ✅ Geometry tools
+│   ├── object_filter.py                ✅ Stage 1 filter
+│   ├── object_captioner.py             🟡 Stub
+│   ├── toolbox_reasoner.py             ✅ Tool-call loop
+│   ├── question_classifier.py          ✅ FIND / COUNT / NAVIGATE
+│   └── main_node.py                    🟡 ROS I/O; LLM TODO
+└── tests/
+    └── test_spatial_toolbox.py         ✅ Toolbox unit tests
 ```
 
 ---
@@ -538,25 +552,26 @@ ai_module/src/vlm_pipeline/
 
 ### Pipeline B — Live
 
-- [ ] `live/explorer.py` — 4 rotate-in-place waypoints, scan stabilisation signal
-- [ ] `live/equirect_to_perspective.py` — equirectangular → 4×90° perspective crops + inverse pixel map
-- [ ] `live/live_detector.py` — GroundingDINO on crops + LiDAR-Camera fusion → 3D bboxes in map frame
-- [ ] `live/live_scene_graph.py` — 3D bboxes → spatial relations → SceneData
-- [ ] `main_node.py` update — `scene_mode` param dispatch (static / live)
+- [x] `live/explorer.py` — 4 rotate-in-place waypoints, scan stabilisation signal
+- [x] `live/equirect_to_perspective.py` — equirectangular → 4×90° perspective crops + inverse pixel map
+- [x] `live/live_detector.py` — GroundingDINO on crops + LiDAR-Camera fusion → 3D bboxes in map frame
+- [x] `live/live_scene_graph.py` — 3D bboxes → spatial relations → SceneData
+- [x] `main_node.py` update — `scene_mode` param dispatch (static / live)
 - [ ] `launch/vlm_pipeline.launch.py` update — expose `scene_mode` param
 - [ ] `tests/test_live_smoke.py` — Pipeline B on chinese_room without VLA-3D data
 - [ ] End-to-end test in simulator — live mode answers correctly for ≥ 2 scenes
 - [ ] Real-robot tuning — LiDAR outlier removal, GroundingDINO threshold tuning
 
-### Pipeline C — SORT3D
+### Pipeline C — SORT3D (`vlm_pipeline_sort3d`, independent package)
 
-- [ ] `sort3d/spatial_toolbox.py` — refactor geometry functions from `graph_search.py` as standalone callables
-- [ ] `sort3d/object_filter.py` — LLM call #1: extract nouns + filter relevant object IDs
-- [ ] `sort3d/toolbox_reasoner.py` — LLM chain-of-thought + execute returned function calls
-- [ ] `sort3d/object_captioner.py` — Qwen2-VL-7B crop captioner (Track B / real robot only)
-- [ ] `main_node.py` update — `reasoning_mode` param (`pipeline_a` vs `sort3d`)
-- [ ] In-context example — write the single few-shot toolbox usage example for the LLM prompt
-- [ ] `tests/test_sort3d_reasoning.py` — run all 45 find+count questions through Pipeline C
+- [x] Package scaffold — `src/vlm_pipeline_sort3d/` (no depend on A/B)
+- [x] `spatial_toolbox.py` — standalone geometry callables
+- [x] `object_filter.py` — noun extract + relevance filter
+- [x] `toolbox_reasoner.py` — CoT + tool execution loop + in-context example
+- [x] `scene_inventory.py` — VLA-3D CSV loader for offline eval
+- [ ] LLM backend wiring in `main_node.py`
+- [ ] `object_captioner.py` — Qwen2-VL crop captioner (live / real robot)
+- [ ] `tests/test_sort3d_reasoning.py` — all 45 find+count questions
 - [ ] Accuracy comparison — Pipeline A vs Pipeline C on all 45 training questions
 
 ### Submission

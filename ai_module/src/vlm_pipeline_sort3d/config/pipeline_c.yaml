@@ -1,0 +1,11 @@
+sort3d_node:
+  ros__parameters:
+    scene_name: "chinese_room"
+    vla3d_root: ""
+    llm_backend: "ollama"
+    llm_model: "llama3.2"
+    use_vlm_captions: false
+    near_threshold_m: 1.5
+    on_contact_threshold_m: 0.05
+    between_threshold_m: 0.5
+    standoff_m: 0.8
