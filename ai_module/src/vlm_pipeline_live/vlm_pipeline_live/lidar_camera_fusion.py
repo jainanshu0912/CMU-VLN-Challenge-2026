@@ -67,13 +67,24 @@ def pointcloud2_to_xyz(msg: PointCloud2) -> np.ndarray:
   if pc2 is None:
     raise RuntimeError("sensor_msgs_py is required to parse PointCloud2 messages")
 
-  points = np.array(
-    list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)),
-    dtype=np.float64,
+  # Prefer the numpy helper when available (avoids structured-dtype cast issues).
+  if hasattr(pc2, "read_points_numpy"):
+    points = pc2.read_points_numpy(msg, field_names=("x", "y", "z"), skip_nans=True)
+    if points.size == 0:
+      return np.empty((0, 3), dtype=np.float64)
+    return np.asarray(points, dtype=np.float64).reshape(-1, 3)
+
+  structured = np.array(
+    list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
   )
-  if points.size == 0:
+  if structured.size == 0:
     return np.empty((0, 3), dtype=np.float64)
-  return points.reshape(-1, 3)
+  # PointCloud2 often returns a padded structured dtype (itemsize 16 for xyz float32).
+  if structured.dtype.names:
+    return np.column_stack(
+      [structured["x"], structured["y"], structured["z"]]
+    ).astype(np.float64, copy=False)
+  return np.asarray(structured, dtype=np.float64).reshape(-1, 3)
 
 
 def map_points_to_camera(

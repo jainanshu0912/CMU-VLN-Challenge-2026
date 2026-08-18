@@ -34,6 +34,7 @@ setup(
       "explorer_node = vlm_pipeline_live.explorer:main",
       "live_detector_node = vlm_pipeline_live.live_detector:main",
       "live_scene_graph_node = vlm_pipeline_live.live_scene_graph_node:main",
+      "write_object_list_from_scene_graph = vlm_pipeline_live.write_object_list_from_scene_graph:main",
     ],
   },
 )

@@ -56,6 +56,20 @@ def prompt_from_question(question: str) -> str:
   return " . ".join(tokens)
 
 
+def _sync_bert_model_warper_import(bertwarper) -> None:
+  """Keep groundingdino.py's BertModelWarper name in sync after reload.
+
+  ``from .bertwarper import BertModelWarper`` binds a class object. Reloading
+  bertwarper alone leaves that stale binding, so GroundingDINO can still run
+  the pre-patch ``__init__`` while the on-disk source already looks fixed.
+  """
+  try:
+    import groundingdino.models.GroundingDINO.groundingdino as gdino
+  except ImportError:
+    return
+  gdino.BertModelWarper = bertwarper.BertModelWarper
+
+
 def _patch_groundingdino_transformers_compat() -> None:
   """Patch GroundingDINO BertModelWarper for transformers 5.x API changes.
 
@@ -64,18 +78,19 @@ def _patch_groundingdino_transformers_compat() -> None:
   """
   import groundingdino.models.GroundingDINO.bertwarper as bertwarper
 
-  if getattr(bertwarper, "_vlm_transformers_patched", False):
+  if getattr(bertwarper, "_vlm_transformers_patched_v2", False):
+    _sync_bert_model_warper_import(bertwarper)
     return
 
   from transformers import BertModel as _BertModel
   if hasattr(_BertModel, "get_head_mask"):
     # transformers 4.x: original GroundingDINO code works fine, nothing to do.
-    bertwarper._vlm_transformers_patched = True
+    bertwarper._vlm_transformers_patched_v2 = True
     return
 
   # transformers 5.x: patch the installed bertwarper.py in place.
+  import importlib
   import inspect
-  import os
 
   bertwarper_path = inspect.getfile(bertwarper)
   print(f"[GroundingDINO] Patching {bertwarper_path} for transformers 5.x ...", flush=True)
@@ -83,51 +98,115 @@ def _patch_groundingdino_transformers_compat() -> None:
   with open(bertwarper_path, encoding="utf-8") as fh:
     src = fh.read()
 
-  if "_vlm_patched_sentinel" in src:
-    bertwarper._vlm_transformers_patched = True
+  # Upgrade any previous getattr-only / bare patch to an explicit try/except.
+  # Only rewrite once (_vlm_patched_v2 marker).
+  if "_vlm_patched_v2" not in src:
+    head_mask_try = (
+      "try:  # _vlm_patched_v2\n"
+      "            self.get_head_mask = bert_model.get_head_mask\n"
+      "        except AttributeError:\n"
+      "            self.get_head_mask = None"
+    )
+    if "getattr(bert_model, 'get_head_mask'" in src:
+      src = src.replace(
+        "self.get_head_mask = getattr(bert_model, 'get_head_mask', None)  # _vlm_patched_sentinel",
+        head_mask_try,
+      )
+    else:
+      src = src.replace(
+        "self.get_head_mask = bert_model.get_head_mask",
+        head_mask_try,
+      )
+
+    # Make the get_extended_attention_mask call accept or drop the `device` arg.
+    if "except TypeError:\n            extended_attention_mask = " not in src:
+      src = src.replace(
+        "extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(\n"
+        "            attention_mask, input_shape, device\n"
+        "        )",
+        (
+          "try:\n"
+          "            extended_attention_mask: torch.Tensor = "
+          "self.get_extended_attention_mask(attention_mask, input_shape, device)\n"
+          "        except TypeError:\n"
+          "            extended_attention_mask = "
+          "self.get_extended_attention_mask(attention_mask, input_shape)"
+        ),
+      )
+
+    # Guard the get_head_mask call so None is handled.
+    if "if self.get_head_mask is not None:" not in src:
+      src = src.replace(
+        "head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)",
+        (
+          "if self.get_head_mask is not None:\n"
+          "            head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)\n"
+          "        else:\n"
+          "            head_mask = [None] * self.config.num_hidden_layers"
+        ),
+      )
+
+    with open(bertwarper_path, "w", encoding="utf-8") as fh:
+      fh.write(src)
+
+  # Reload + rebind so already-imported GroundingDINO sees the new class.
+  importlib.reload(bertwarper)
+  _sync_bert_model_warper_import(bertwarper)
+
+  bertwarper._vlm_transformers_patched_v2 = True
+  print("[GroundingDINO] bertwarper.py patched for transformers 5.x.", flush=True)
+
+
+def _patch_groundingdino_ms_deform_attn_fallback() -> None:
+  """Use PyTorch MSDeformAttn when GroundingDINO CUDA extension ``_C`` is missing.
+
+  Pip installs often ship without the compiled ops. Upstream then still takes the
+  CUDA branch and crashes with ``NameError: _C is not defined``.
+  """
+  import importlib
+  import inspect
+
+  import groundingdino.models.GroundingDINO.ms_deform_attn as msda
+
+  if getattr(msda, "_vlm_msda_fallback_patched", False):
     return
 
-  # 1. Replace the bare attribute access that crashes on transformers 5.x.
-  src = src.replace(
-    "self.get_head_mask = bert_model.get_head_mask",
-    "self.get_head_mask = getattr(bert_model, 'get_head_mask', None)  # _vlm_patched_sentinel",
-  )
+  path = inspect.getfile(msda)
+  with open(path, encoding="utf-8") as fh:
+    src = fh.read()
 
-  # 2. Make the get_extended_attention_mask call accept or drop the `device` arg.
-  src = src.replace(
-    "extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(\n"
-    "            attention_mask, input_shape, device\n"
-    "        )",
-    (
-      "try:\n"
-      "            extended_attention_mask: torch.Tensor = "
-      "self.get_extended_attention_mask(attention_mask, input_shape, device)\n"
-      "        except TypeError:\n"
-      "            extended_attention_mask = "
-      "self.get_extended_attention_mask(attention_mask, input_shape)"
-    ),
-  )
+  if "_vlm_msda_fallback" not in src:
+    old = "if torch.cuda.is_available() and value.is_cuda:"
+    new = (
+      "if torch.cuda.is_available() and value.is_cuda "
+      "and globals().get('_C') is not None:  # _vlm_msda_fallback"
+    )
+    if old not in src:
+      print(
+        "[GroundingDINO] ms_deform_attn.py CUDA-branch pattern not found; "
+        "skipping _C fallback patch.",
+        flush=True,
+      )
+      msda._vlm_msda_fallback_patched = True
+      return
+    with open(path, "w", encoding="utf-8") as fh:
+      fh.write(src.replace(old, new, 1))
+    print(f"[GroundingDINO] Patched {path} to fall back without _C ops.", flush=True)
 
-  # 3. Guard the get_head_mask call so None is handled.
-  src = src.replace(
-    "head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)",
-    (
-      "if self.get_head_mask is not None:\n"
-      "            head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)\n"
-      "        else:\n"
-      "            head_mask = [None] * self.config.num_hidden_layers"
-    ),
-  )
+  importlib.reload(msda)
+  # Keep transformer module's imported MSDA class in sync if already loaded.
+  try:
+    import groundingdino.models.GroundingDINO.transformer as transformer
+    transformer.MSDeformAttn = msda.MultiScaleDeformableAttention
+  except Exception:
+    pass
+  msda._vlm_msda_fallback_patched = True
 
-  with open(bertwarper_path, "w", encoding="utf-8") as fh:
-    fh.write(src)
 
-  # Reload the module so the running process picks up the changes.
-  import importlib
-  importlib.reload(bertwarper)
-
-  bertwarper._vlm_transformers_patched = True
-  print("[GroundingDINO] bertwarper.py patched for transformers 5.x.", flush=True)
+def _patch_groundingdino_runtime() -> None:
+  """Apply all GroundingDINO install/runtime shims used by Pipeline B."""
+  _patch_groundingdino_transformers_compat()
+  _patch_groundingdino_ms_deform_attn_fallback()
 
 
 class GroundingDinoBackend:
@@ -150,7 +229,7 @@ class GroundingDinoBackend:
     self.device = device or self._default_device(force_cpu)
     self._model = None
     if self.is_available:
-      _patch_groundingdino_transformers_compat()
+      _patch_groundingdino_runtime()
 
   @staticmethod
   def _default_device(force_cpu: bool = False) -> str:
@@ -190,7 +269,7 @@ class GroundingDinoBackend:
         flush=True,
       )
 
-    _patch_groundingdino_transformers_compat()
+    _patch_groundingdino_runtime()
 
     from groundingdino.util.inference import load_model
 
@@ -215,7 +294,7 @@ class GroundingDinoBackend:
     if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
       raise ValueError(f"Expected H×W×3 RGB image, got {image_rgb.shape}")
 
-    _patch_groundingdino_transformers_compat()
+    _patch_groundingdino_runtime()
     from groundingdino.util.inference import predict
 
     model = self._load_model()
