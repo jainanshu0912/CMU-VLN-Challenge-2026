@@ -220,6 +220,9 @@ After `/vlm_live/detection_complete`, the scene-graph node publishes:
 
 Also writes `/tmp/vlm_live_scene_graph.json` by default.
 
+A checked-in sample from a sim run lives at
+[`data/live_scene/`](data/live_scene/) (`live_scene_scene_graph.json` + CSV object list).
+
 ```bash
 ros2 launch vlm_pipeline_live live_scene_graph.launch.py
 # or included in pipeline_b_manual_cpu.launch.py
