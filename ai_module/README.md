@@ -1,5 +1,7 @@
 # AI module — sequential VLN pipeline
 
+Evaluators: see **[INSTRUCTIONS.md](INSTRUCTIONS.md)** for the few extra steps on top of the official `docker/README.md`.
+
 Evaluation launch (same command as the challenge dummy VLM):
 
 ```bash
@@ -104,4 +106,3 @@ ros2 launch vlm_pipeline vlm_pipeline.launch.py \
   vla3d_data_root:=/home/docker/ai_module/src/vlm_pipeline_live/data
 ```
 
-Do not run that together with `dummy_vlm.launch` — two nodes would fight over waypoints.
