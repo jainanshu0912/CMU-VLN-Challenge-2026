@@ -1,247 +1,74 @@
-# Pipeline B — Live Scene Graph
+# Pipeline B — Live Scene Graph (`vlm_pipeline_live`)
 
-Separate ROS 2 package from Track A (`vlm_pipeline`). Builds a live scene representation from onboard sensors for held-out test scenes and the real robot.
+ROS 2 package that builds a **live** indoor scene representation from the robot’s
+onboard **360° camera + LiDAR**, then turns it into a **VLA-3D-style scene graph**
+that Pipeline A (`vlm_pipeline`) can query for find / count / navigate.
 
-## Current status
+This is separate from Track A’s static offline graphs under `~/vla3d_data`.
 
-| Module | Status |
+## What's new (recent changes)
+
+| Change | Detail |
 |--------|--------|
-| `explorer.py` | Rotate-in-place exploration (4 views) |
-| `scan_stability.py` | Registered scan stabilisation gate |
-| `live_scene_graph.py` | VLA-3D-style relations → `SceneData` / scene_graph.json |
-| `live_detector.py` | GroundingDINO + LiDAR fusion → 3D boxes |
-| `equirect_to_perspective.py` | 360° → 4×90° perspective crops + ray maps |
+| **Pluggable 2D backends** | Same fusion / NMS / graph path; swap vision with `detector_backend:=grounding_dino` \| `yolo_world` \| `yoloe` \| `owlvit`. |
+| **YOLOE / YOLO-World** | Ultralytics open-vocab (`yoloe-11s-seg.pt` / `yolov8s-worldv2.pt`) for A/B vs GroundingDINO. |
+| **Gemini label verify** | Free Flash API (`gemini_verify:=true`) keep/relabel/drop boxes **after** detection, before LiDAR fusion. |
+| **Backend A/B compare** | `compare_backend_runs` scores DINO / DINO+Gemini / YOLOE graphs vs Unity GT in one table. |
+| **Class-aware 3D NMS + label canonicalize** | Same-label merges with size-aware radius; cleans noisy DINO/YOLO phrases before the graph. |
+| **Desktop debug snapshots** | Annotated crops + cyan fused centers on host `~/Desktop/vlm_live_snapshots`. |
+| **GPU-only** | CPU launch files removed; vision backends require CUDA. |
+| **Unique graph captures** | Timestamped folders under `/tmp/vlm_live_captures/` + `compare_scene_graphs` vs Unity GT. |
 
-## Explorer
+---
 
-Publishes four viewing waypoints with headings **0° / 90° / 180° / 270°**. Each waypoint is offset **`rotation_standoff_m`** (default 0.6 m) from the anchor pose along the target heading — the autonomy stack treats same-`(x,y)` goals as already reached and sends zero speed, so a small forward offset is required for the robot to rotate and drive. After each view it waits **`scan_settle_sec`** (default 6 s) before the next heading; optional **`require_scan_stable`** uses point-count spread on `/registered_scan` (usually off for accumulated maps).
+## What this pipeline does (big picture)
 
-### Topics
-
-| Direction | Topic | Type |
-|-----------|-------|------|
-| Subscribe | `/state_estimation` | `nav_msgs/Odometry` |
-| Subscribe | `/registered_scan` | `sensor_msgs/PointCloud2` |
-| Publish | `/way_point_with_heading` | `geometry_msgs/Pose2D` |
-| Publish | `/vlm_live/exploration_complete` | `std_msgs/Bool` |
-
-Downstream Pipeline B nodes (detector, scene graph) should subscribe to `/vlm_live/exploration_complete`.
-
-### Build
-
-```bash
-cd ai_module
-source /opt/ros/jazzy/setup.bash
-colcon build --packages-select vlm_pipeline_live
-source install/setup.bash
+```text
+ /camera/image  (equirect 360°)
+        │
+        ▼
+  4× 90° perspective crops
+        │
+        ▼
+  Open-vocab 2D backend  ──►  2D boxes + labels on each crop
+  (grounding_dino | yolo_world | yoloe)
+        │
+        ▼
+  Optional Gemini verify (keep / relabel / drop)
+        │
+        ▼
+  LiDAR fusion (/registered_scan + /state_estimation)
+        │                 LiDAR points that fall inside each 2D box
+        ▼                 → 3D AABB in map frame
+  Accumulated 3D objects (class-aware NMS across views)
+        │
+        ▼
+  Live scene graph (near / on / closest / …)
+        │
+        ▼
+  Optional: export CSV/JSON → Pipeline A find/count/navigate
 ```
 
-### Run (simulator must be in waypoint mode)
+**Important split (read this first):**
 
-```bash
-ros2 launch vlm_pipeline_live explorer.launch.py
-```
+| Stage | What it is | Used for navigation? |
+|-------|------------|----------------------|
+| 2D boxes on crop images | **Chosen backend only** (vision) | No |
+| Cyan crosses on crop images | Fused **3D centers** reprojected into the crop | Diagnostic only |
+| `/vlm_live/detections_json` + RViz markers | **Fused 3D** boxes in `map` | Yes — these positions feed the graph / later nav |
+| Scene graph relations | Geometry on those 3D boxes | Querying (find/count), not motion itself |
 
-Or:
+If labels/boxes look wrong on the Desktop PNGs → vision / prompt / crop / **backend** issue.  
+If boxes look fine but cyan is far outside the box → camera–LiDAR alignment / projection issue.  
+If both look fine but the robot still goes to the wrong place → object choice, standoff, or autonomy/trav — not necessarily the 2D model.
 
-```bash
-ros2 run vlm_pipeline_live explorer_node
-```
+---
 
-### Parameters
+## Recommended mode right now: **manual teleop**
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `headings_deg` | `[0, 90, 180, 270]` | View headings (degrees) |
-| `rotation_standoff_m` | `0.8` | Forward offset from current pose for each waypoint (match Track A standoff; must exceed `position_tolerance_m`) |
-| `position_tolerance_m` | `0.2` | Max distance to waypoint to accept a view (stack `waypointXYRadius` is ~0.3 m) |
-| `min_settle_before_reached_sec` | `1.0` | Ignore reach checks briefly after publishing (avoids false positives) |
-| `heading_tolerance_rad` | `0.35` | Yaw error to accept a view |
-| `heading_wait_timeout_sec` | `120.0` | Max wait per view for robot to reach waypoint |
-| `waypoint_republish_sec` | `2.0` | Republish interval while waiting |
-| `require_scan_stable` | `false` | If true, gate on scan point-count stability (poor fit for growing maps) |
-| `scan_settle_sec` | `6.0` | Fixed pause after each view when `require_scan_stable` is false |
-| `scan_stable_window_sec` | `5.0` | Window for optional scan stability check |
-| `scan_change_threshold` | `0.05` | Max relative point-count spread when `require_scan_stable` is true |
-| `scan_stable_timeout_sec` | `30.0` | Max wait per view for stable scan |
+Manual teleop is still the best way to debug labels. The autonomous explorer now plans **5–6 XY standpoints** from `/registered_scan` and runs a 360° detect at each stop.
 
-## Equirect → perspective
-
-`equirect_to_perspective.py` converts `/camera/image` (1920×640, 360°×120° FOV) into four **640×640** perspective crops aligned with explorer headings (**0° / 90° / 180° / 270°**, ~90° HFOV each).
-
-Each crop includes a precomputed **pixel → unit ray** map in the camera optical frame (`x` right, `y` down, `z` forward). `live_detector.py` will use this for LiDAR–camera fusion.
-
-```python
-from vlm_pipeline_live.equirect_to_perspective import (
-  EquirectPerspectiveProjector,
-  ros_image_to_numpy,
-)
-
-projector = EquirectPerspectiveProjector()
-crops = projector.crop_all(ros_image_to_numpy(camera_msg))
-
-for crop in crops:
-  ray = crop.ray_at(px=320, py=320)  # unit ray at crop center
-```
-
-Run the built-in sanity check:
-
-```bash
-python3 -m vlm_pipeline_live.equirect_to_perspective
-```
-
-## Live detector
-
-`live_detector.py` runs **GroundingDINO** on the four perspective crops, then fuses each 2D box with **`/registered_scan`** using robot pose from **`/state_estimation`**.
-
-After **`/vlm_live/exploration_complete`**, the node publishes:
-
-| Topic | Type | Purpose |
-|-------|------|---------|
-| `/vlm_live/detections_json` | `std_msgs/String` | Fused 3D detections (JSON) |
-| `/vlm_live/detection_markers` | `visualization_msgs/MarkerArray` | Debug boxes in `map` |
-| `/vlm_live/detection_complete` | `std_msgs/Bool` | Signals downstream scene-graph build |
-
-### GroundingDINO setup (inside ai_module container)
-
-```bash
-pip install torch torchvision
-pip install git+https://github.com/IDEA-Research/GroundingDINO.git
-
-mkdir -p /home/docker/models
-# Download config + checkpoint into /home/docker/models/
-```
-
-Set paths via launch args or environment:
-
-```bash
-export GROUNDINGDINO_CONFIG=/home/docker/models/GroundingDINO_SwinT_OGC.py
-export GROUNDINGDINO_CHECKPOINT=/home/docker/models/groundingdino_swint_ogc.pth
-```
-
-### Run
-
-```bash
-# Terminal 1 — exploration
-ros2 launch vlm_pipeline_live explorer.launch.py
-
-# Terminal 2 — detector (auto-runs when exploration completes)
-ros2 launch vlm_pipeline_live live_detector.launch.py \
-  box_threshold:=0.3 text_threshold:=0.25
-```
-
-### Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `model_config_path` | `/home/docker/models/GroundingDINO_SwinT_OGC.py` | GroundingDINO config |
-| `model_checkpoint_path` | `/home/docker/models/groundingdino_swint_ogc.pth` | Weights |
-| `box_threshold` | `0.3` | Detection confidence |
-| `text_threshold` | `0.25` | Text-token confidence |
-| `detection_prompt` | indoor object list | Caption for exploration mapping |
-| `min_lidar_points` | `8` | Min LiDAR points inside a 2D box |
-| `auto_run_on_exploration_complete` | `true` | Wait for explorer; set `false` for manual teleop mode |
-| `allow_repeat_detection` | `true` | Allow multiple `/vlm_live/run_detection` triggers |
-| `accumulate_detections` | `true` | Merge objects across manual snapshots (3D NMS) |
-| `save_snapshots` | `false` | Save equirect PNG + pose JSON per trigger |
-| `snapshot_dir` | `/tmp/vlm_live_snapshots` | Snapshot output directory |
-| `nms_distance_m` | `0.5` | 3D dedup distance across crops |
-
-Question-specific prompts can be built in Python:
-
-```python
-from vlm_pipeline_live.grounding_dino_backend import prompt_from_question
-prompt_from_question("Find the pillow closest to the book on the stool.")
-# → "pillow . book . stool"
-```
-
-## Package layout
-
-```
-vlm_pipeline_live/
-├── launch/
-│   ├── explorer.launch.py
-│   ├── live_detector.launch.py
-│   ├── pipeline_b.launch.py
-│   ├── pipeline_b_cpu.launch.py
-│   ├── pipeline_b_manual.launch.py
-│   ├── pipeline_b_manual_cpu.launch.py
-│   └── live_scene_graph.launch.py
-└── vlm_pipeline_live/
-    ├── explorer.py
-    ├── scan_stability.py
-    ├── equirect_to_perspective.py
-    ├── grounding_dino_backend.py
-    ├── lidar_camera_fusion.py
-    ├── live_detector.py
-    ├── live_scene_graph.py
-    └── live_scene_graph_node.py
-```
-
-## Live scene graph
-
-`live_scene_graph.py` converts fused 3D detections into a **VLA-3D / IRef-VLA** scene graph (same JSON schema as `*_scene_graph.json`) and a Pipeline A `SceneData` object that `GraphSearchMatcher` / `CountPipeline` can consume.
-
-Heuristics follow [VLA-3D `scene_graph/generate_scene_info.py`](https://github.com/HaochenZ11/VLA-3D/tree/main/scene_graph) (above/below/on/in/near/closest/farthest/between/hanging_on), with **absolute** near distance (default 1.5 m) matching Pipeline A's geometric fallback.
-
-### Relations
-
-| Relation | Rule (AABB) |
-|----------|-------------|
-| `above` / `below` | XY IOM ≥ 0.5 and vertical separation |
-| `on` | Contact gap ≤ 15 cm + XY IOM ≥ 0.5 + larger support footprint |
-| `in` | Target center inside container + smaller size (container-like labels) |
-| `near` | XY center distance < 1.5 m |
-| `beside` | Near and not stacked |
-| `closest` / `farthest` | Per-class distance ranking (VLA-3D schema) |
-| `between` | Target projects onto segment between two anchors (perp ≤ 0.5 m) |
-| `hanging_on` | Elevated near anchor, not already on/in something |
-
-### Offline / library usage
-
-```python
-from vlm_pipeline_live.live_scene_graph import LiveSceneGraphBuilder
-from vlm_pipeline.graph_search import GraphSearchMatcher
-
-result = LiveSceneGraphBuilder(scene_name="live_scene").build_from_detections(detections)
-scene = result.scene  # vlm_pipeline.scene_loader.SceneData
-matcher = GraphSearchMatcher()
-# matcher.find(scene, parsed_query)
-```
-
-### ROS
-
-After `/vlm_live/detection_complete`, the scene-graph node publishes:
-
-| Topic | Type |
-|-------|------|
-| `/vlm_live/scene_graph_json` | `std_msgs/String` (VLA-3D JSON) |
-| `/vlm_live/scene_graph_complete` | `std_msgs/Bool` |
-
-Also writes `/tmp/vlm_live_scene_graph.json` by default.
-
-A checked-in sample from a sim run lives at
-[`data/live_scene/`](data/live_scene/) (`live_scene_scene_graph.json` + CSV object list).
-
-```bash
-ros2 launch vlm_pipeline_live live_scene_graph.launch.py
-# or included in pipeline_b_manual_cpu.launch.py
-```
-
-### Unit test
-
-```bash
-cd ai_module/src/vlm_pipeline_live
-PYTHONPATH=../vlm_pipeline:$PYTHONPATH python3 -m unittest tests.test_live_scene_graph
-```
-
-Integration with Pipeline A (`main_node` `scene_mode:=live`) is the next step after you have live graphs from teleop mapping.
-
-## Manual teleop mapping (recommended — GPU)
-
-Use this on a machine with NVIDIA GPU + CUDA torch. Teleop the robot, then trigger detection.
-
-### Build
+### 1. Build (inside `iros2026_ai_module`)
 
 ```bash
 cd /home/docker/ai_module
@@ -250,59 +77,474 @@ colcon build --packages-select vlm_pipeline vlm_pipeline_live
 source install/setup.bash
 ```
 
-### Verify GPU inside the AI container
+### 2. Launch detector + scene graph
 
 ```bash
-python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no gpu')"
+ros2 launch vlm_pipeline_live pipeline_b_manual.launch.py \
+  scene_name:=office_2 \
+  scene_type:=office \
+  detector_backend:=yoloe \
+  save_snapshots:=true
 ```
 
-### Run
+Defaults worth knowing:
 
-```bash
-ros2 launch vlm_pipeline_live pipeline_b_manual.launch.py
-# optional: device:=cuda:0
-# CPU fallback: pipeline_b_manual_cpu.launch.py
-```
+| Launch arg | Default | Meaning |
+|------------|---------|---------|
+| `detector_backend` | `grounding_dino` | `grounding_dino` \| `yolo_world` \| `yoloe` \| `owlvit` |
+| `yolo_model` | `""` | Empty → backend default (`yolov8s-worldv2.pt` or `yoloe-11s-seg.pt`) |
+| `gemini_verify` | `false` | Gemini Flash keep/relabel/drop after 2D detection |
+| `gemini_model` | `gemini-3.6-flash` | Free-tier verify model |
+| `scene_type` | `office` | Exact Unity scene (`office_2`, `hotel_room_1`, …) or `office` \| `hotel` \| `livingroom` \| `home` \| `cultural` \| `indoor` |
+| `detection_prompt` | `""` | If set, overrides `scene_type` caption |
+| `scene_name` | `office_2` | Name stamped into saved graphs |
+| `save_snapshots` | `true` | Write annotated crops to disk |
+| `snapshot_dir` | `/tmp/vlm_live_snapshots` | **Bind-mounted to host `~/Desktop/vlm_live_snapshots`** |
+| `graph_output_dir` | `/tmp/vlm_live_captures` | Unique timestamped graph folders |
 
-### Workflow
+### 3. Map the room
 
-1. Drive the robot with RViz teleop / smart joystick to a viewpoint.
-2. Let `/registered_scan` and `/camera/image` update briefly.
-3. Trigger detection (GPU: typically seconds–tens of seconds for 4 crops):
+1. Teleop to a good viewpoint; wait a moment for camera + scan to update.
+2. Trigger one detection:
 
 ```bash
 ros2 topic pub --once /vlm_live/run_detection std_msgs/msg/Bool "{data: true}"
 ```
 
-4. Scene-graph node builds relations after `/vlm_live/detection_complete` → `/vlm_live/scene_graph_json` (+ `/tmp/vlm_live_scene_graph.json`).
-5. Move to new viewpoints and re-trigger (detections accumulate; graph rebuilds).
-6. RViz: MarkerArray on `/vlm_live/detection_markers`, frame `map`.
-
-Expect log: `GroundingDINO backend available | device=cuda`
-
-### Manual-mode topics
-
-| Topic | Type | Role |
-|-------|------|------|
-| `/vlm_live/run_detection` | `std_msgs/Bool` | Run GroundingDINO + fusion |
-| `/vlm_live/clear_detections` | `std_msgs/Bool` | Reset accumulated map |
-| `/vlm_live/detections_json` | `std_msgs/String` | Merged 3D objects |
-| `/vlm_live/detection_markers` | `visualization_msgs/MarkerArray` | RViz boxes |
-| `/vlm_live/scene_graph_json` | `std_msgs/String` | VLA-3D scene graph |
-| `/vlm_live/scene_graph_complete` | `std_msgs/Bool` | Graph ready |
-
-## CPU fallback
+3. Move to a **new** viewpoint (don’t spam detect from the same pose).
+4. Trigger again — detections **accumulate** with class-aware 3D NMS.
+5. Start a fresh capture:
 
 ```bash
-ros2 launch vlm_pipeline_live pipeline_b_manual_cpu.launch.py
-# or explorer+detector:
-ros2 launch vlm_pipeline_live pipeline_b_cpu.launch.py
+ros2 topic pub --once /vlm_live/clear_detections std_msgs/msg/Bool "{data: true}"
 ```
 
-Pin transformers if needed: `pip install --break-system-packages 'transformers>=4.37,<5'`
+### 4. Inspect debug images on the host Desktop
 
-GPU explorer path (once waypoints work):
+After each trigger, open:
+
+```text
+~/Desktop/vlm_live_snapshots/snapshot_XXXX_<ts>/
+  snapshot_XXXX_equirect.png           # full 360°
+  snapshot_XXXX_crop_h000.png          # raw 90° crop
+  snapshot_XXXX_crop_h000_boxes.png    # ← look here
+  snapshot_XXXX_crop_h090_boxes.png
+  snapshot_XXXX_crop_h180_boxes.png
+  snapshot_XXXX_crop_h270_boxes.png
+  snapshot_XXXX_meta.json
+```
+
+**How to read `*_boxes.png`:**
+
+- **Colored rectangles + text** (`chair 0.87`) = **2D backend** result on that crop only.
+- **Cyan crosses** = 3D fused object centers (from LiDAR points inside boxes) projected back into the crop.
+  - Cyan inside the box → fusion is at least consistent with that detection.
+  - Cyan far outside / missing → suspect LiDAR–camera geometry or empty/wrong point association.
+
+---
+
+## Pluggable 2D backends (A/B comparison)
+
+All backends share one API (`detection_backend.create_detection_backend`). Fusion, NMS, scene graph, and snapshots stay the same — only the 2D boxes/labels change.
+
+| Backend | Launch | Notes |
+|---------|--------|-------|
+| GroundingDINO | `detector_backend:=grounding_dino` (default) | Needs config + checkpoint under `/home/docker/models/` |
+| YOLO-World v2 | `detector_backend:=yolo_world` | Ultralytics `YOLOWorld`; default `yolov8s-worldv2.pt` |
+| **YOLOE (YOLO11 open-vocab)** | `detector_backend:=yoloe` | Ultralytics `YOLOE`; default `yoloe-11s-seg.pt` — closest to “YOLO v11 World” |
+| **OWL-ViT v2** | `detector_backend:=owlvit` | Hugging Face `google/owlv2-base-patch16` (override with `yolo_model:=…`) |
+| Gemini as detector | `detector_backend:=gemini` | Not implemented — Gemini is a **verifier**, not a box proposer |
+
+**About “YOLO v11 World”:** There is no separate Ultralytics `yolov11-world` checkpoint. Open-vocab on the YOLO11 line is **YOLOE** (`yoloe-11*-seg.pt`). Classic **YOLO-World** remains `yolov8*-worldv2.pt`. Prefer `yoloe` for the YOLO11 comparison; use `yolo_model:=yoloe-11m-seg.pt` / `yoloe-11l-seg.pt` for stronger models. Do **not** use `*-seg-pf.pt` (prompt-free) — those reject `set_classes()`.
+
+### Gemini label verification (free Flash API)
+
+After DINO/YOLO proposes boxes, optionally ask **Gemini Flash** to **keep / relabel / drop** each box before LiDAR fusion. Boxes still come from the detector; Gemini only cleans labels.
 
 ```bash
-ros2 launch vlm_pipeline_live pipeline_b.launch.py
+# Host: create a key at https://aistudio.google.com/apikey then export + recreate AI container
+export GEMINI_API_KEY="AIza..."   # must be a real Generative Language API key
+# (or GOOGLE_API_KEY)
+echo "key len=${#GEMINI_API_KEY}"  # sanity: should be > 20
+cd ~/CMU-VLN-Challenge-2026/docker
+docker compose -f compose_gpu.dev.yml up -d --force-recreate ai_module
+
+# Inside AI container — confirm the key arrived
+echo "container key len=${#GEMINI_API_KEY} suffix=${GEMINI_API_KEY: -4}"
+pip3 install -U --break-system-packages google-genai pillow
+
+ros2 launch vlm_pipeline_live pipeline_b_manual.launch.py \
+  scene_name:=office_2 \
+  detector_backend:=yoloe \
+  gemini_verify:=true \
+  gemini_model:=gemini-3.6-flash \
+  save_snapshots:=true
+```
+
+If logs say `API_KEY_INVALID`, Gemini never ran — the pipeline fail-opens and keeps detector boxes. Create a new key in AI Studio, export it on the **host**, recreate the container, and confirm `container key len=...` is non-zero before launching. If logs say the model is `no longer available`, switch to `gemini_model:=gemini-3.6-flash` (current default).
+
+| Arg | Default | Meaning |
+|-----|---------|---------|
+| `gemini_verify` | `false` | Enable Gemini keep/relabel/drop |
+| `gemini_model` | `gemini-3.6-flash` | Free-tier Flash model |
+| `gemini_api_key` | `""` | Optional override; else env `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
+| `gemini_fail_open` | `true` | On API/parse errors, keep original detector boxes |
+
+Logs show `[gemini_verify] N → M (keep=… relabel=… drop=…)`. Desktop `*_boxes.png` are **after** verification.
+
+If you see `Expecting ',' delimiter` or `503 UNAVAILABLE`, rebuild — the verifier now uses JSON schema mode, batches ≤12 boxes/call, retries short 503s, and repairs mildly broken JSON. A `dino_gemini` capture only counts as different from plain DINO when those success logs appear.
+
+**Free-tier quota:** `gemini-3.6-flash` is often capped around **20 requests/day**. One detection trigger uses several calls (4 crops × batches). After `429 RESOURCE_EXHAUSTED` / `GenerateRequestsPerDay`, the verifier **disables for the rest of the run** and keeps DINO boxes. For multi-pose mapping today, use `gemini_verify:=false`, or wait for quota reset / try another model / enable billing.
+
+### Install YOLO deps (inside `iros2026_ai_module`)
+
+```bash
+# PEP 668: use --break-system-packages inside the AI container (same as Dockerfile torch/DINO installs)
+pip3 install -U --break-system-packages ultralytics
+# YOLOE text prompts also need Ultralytics CLIP (set_classes); auto-install fails under PEP 668
+pip3 install -U --break-system-packages git+https://github.com/ultralytics/CLIP.git
+```
+
+First run downloads weights + a MobileCLIP text encoder for YOLOE (needs network once).
+
+### Compare backends on the same teleop tour
+
+1. Run with DINO, trigger detections from a few poses, archive/compare the graph.
+2. Clear, relaunch with `detector_backend:=yoloe` (or `yolo_world`), repeat the **same** viewpoints.
+3. Diff Desktop `*_boxes.png` and `compare_scene_graphs` Label P/R + matched counts.
+
+```bash
+# GroundingDINO (default)
+ros2 launch vlm_pipeline_live pipeline_b_manual.launch.py \
+  scene_name:=office_2 detector_backend:=grounding_dino save_snapshots:=true
+
+# YOLOE / YOLO11 open-vocab (recommended YOLO path)
+ros2 launch vlm_pipeline_live pipeline_b_manual.launch.py \
+  scene_name:=office_2 detector_backend:=yoloe \
+  yolo_model:=yoloe-11s-seg.pt save_snapshots:=true
+
+# OWL-ViT v2 (zero-shot; first run downloads google/owlv2-base-patch16)
+ros2 launch vlm_pipeline_live pipeline_b_manual.launch.py \
+  scene_name:=office_2 detector_backend:=owlvit \
+  box_threshold:=0.2 save_snapshots:=true
+
+# Classic YOLO-World v2
+ros2 launch vlm_pipeline_live pipeline_b_manual.launch.py \
+  scene_name:=office_2 detector_backend:=yolo_world \
+  yolo_model:=yolov8s-worldv2.pt save_snapshots:=true
+```
+
+---
+
+## Module-by-module
+
+### `equirect_to_perspective.py`
+
+- Input: `/camera/image` equirect (~1920×640, 360°×120°).
+- Output: four **640×640** crops at headings **0° / 90° / 180° / 270°** (~90° HFOV).
+- Also builds per-pixel **rays** in the camera optical frame for projecting LiDAR into the crop.
+
+### `detection_backend.py` + backends + `label_utils.py`
+
+- Factory: `create_detection_backend("grounding_dino" | "yolo_world" | "yoloe" | "owlvit" | …)`.
+- Optional: `gemini_label_verifier.py` — Gemini Flash keep/relabel/drop per crop (`gemini_verify:=true`).
+- Same dotted caption for all backends (`chair . desk . lamp`); YOLO splits it via `set_classes`.
+- **`scene_type:=office_2` / `hotel_room_1` / …** → per-scene caption built from that Unity GT vocab.
+- **`scene_type:=office` / `hotel` / `livingroom` / `home` / `cultural`** → aggregated type prompts.
+- **`scene_type:=indoor`** → livingroom aggregate (general indoor).
+- Regenerate captions from GT: `python3 scripts/generate_scene_prompts.py` (then paste into `label_utils.py`).
+- **`canonicalize_label()`** cleans phrases (`trash bin` → `trash can`, `cabinet shelf` → `cabinet`) before NMS / graph.
+
+Wrong bbox labels here are a **vision / backend** problem, not navigation math yet.
+
+### `lidar_camera_fusion.py`
+
+For each 2D box:
+
+1. Transform `/registered_scan` points into the camera frame using `/state_estimation`.
+2. Project points into that crop.
+3. Keep points that fall **inside the 2D box**.
+4. If enough points (`min_lidar_points`, default 8) → fit a 3D axis-aligned box in **map** frame.
+
+Then **class-aware 3D NMS**:
+
+- Only merge detections with the **same canonical label**.
+- Merge radius grows with object size (desks merge more aggressively than cups).
+- Prefer higher confidence, then more LiDAR points.
+
+These 3D boxes are what RViz markers and the scene graph use.
+
+### `live_detector.py`
+
+ROS node wiring:
+
+| Subscribe | Publish |
+|-----------|---------|
+| `/camera/image` | `/vlm_live/detections_json` |
+| `/registered_scan` | `/vlm_live/detection_markers` |
+| `/state_estimation` | `/vlm_live/detection_complete` |
+| `/vlm_live/run_detection` | |
+| `/vlm_live/clear_detections` | |
+| `/vlm_live/exploration_complete` (optional extra snap) | |
+
+Also writes Desktop snapshots when `save_snapshots:=true`.
+
+### `live_scene_graph.py` / `live_scene_graph_node.py`
+
+Builds VLA-3D-compatible relations (`near`, `on`, `above`, `closest`, …) from the fused 3D boxes.
+
+Saves uniquely so runs are not overwritten:
+
+```text
+/tmp/vlm_live_captures/<scene_name>/<YYYYMMDD_HHMMSS>/scene_graph.json
+/tmp/vlm_live_captures/<scene_name>/latest_scene_graph.json   # pointer only
+```
+
+### Eval helpers
+
+| Tool | Role |
+|------|------|
+| `archive_captured_scene` | Copy a graph into `data/captured/<scene>/<run_id>/` |
+| `compare_scene_graphs` | Score live graph vs `~/vla3d_data/Unity/<scene>/` |
+| `write_object_list_from_scene_graph` | Export Pipeline A CSV + scene folder |
+
+Example compare:
+
+```bash
+ros2 run vlm_pipeline_live compare_scene_graphs -- \
+  --pred /tmp/vlm_live_captures/office_2/latest_scene_graph.json \
+  --gt ~/vla3d_data/Unity/office_2/office_2_scene_graph.json \
+  --out /tmp/office_2_compare.json
+```
+
+**Label P / R** in the report = how well predicted **class counts** match GT (ignores XYZ).  
+**Matched** = same canonical label **and** close in XY.  
+Navigation quality is closer to **matched 3D positions**, not label P/R alone.
+
+---
+
+## Data flow vs Pipeline A
+
+```text
+Pipeline B (this package)          Pipeline A (vlm_pipeline)
+─────────────────────────          ────────────────────────
+live 3D objects + scene graph  →   SceneLoader / GraphSearchMatcher
+                                   publish /way_point_with_heading
+                                   autonomy drives there
+```
+
+Export for A:
+
+```bash
+ros2 run vlm_pipeline_live write_object_list_from_scene_graph -- \
+  --graph /tmp/vlm_live_captures/office_2/latest_scene_graph.json \
+  --out-dir /tmp/vla3d_live/office_2 \
+  --scene-name office_2
+
+ros2 launch vlm_pipeline vlm_pipeline.launch.py \
+  scene_name:=office_2 \
+  vla3d_data_root:=/tmp/vla3d_live
+```
+
+---
+
+## Package layout
+
+```text
+vlm_pipeline_live/
+├── README.md
+├── launch/
+│   ├── pipeline_b_manual.launch.py      # teleop + manual detect
+│   ├── pipeline_b.launch.py             # coverage explorer + detect-per-stop
+│   ├── explorer.launch.py
+│   ├── live_detector.launch.py
+│   └── live_scene_graph.launch.py
+├── data/
+│   ├── live_scene/                      # sample checked-in graph
+│   └── captured/                        # archived runs
+└── vlm_pipeline_live/
+    ├── equirect_to_perspective.py
+    ├── grounding_dino_backend.py
+    ├── label_utils.py
+    ├── lidar_camera_fusion.py
+    ├── detection_vis.py                 # boxes + cyan overlays
+    ├── live_detector.py
+    ├── live_scene_graph.py
+    ├── live_scene_graph_node.py
+    ├── capture_paths.py
+    ├── archive_captured_scene.py
+    ├── compare_scene_graphs.py
+    ├── write_object_list_from_scene_graph.py
+    ├── explorer.py
+    ├── viewpoint_planner.py
+    └── scan_stability.py
+```
+
+---
+
+## Docker note (snapshots on Desktop)
+
+`compose_gpu.dev.yml` mounts:
+
+```text
+~/Desktop/vlm_live_snapshots  →  /tmp/vlm_live_snapshots
+```
+
+Recreate `ai_module` after compose changes:
+
+```bash
+cd ~/CMU-VLN-Challenge-2026/docker
+docker compose -f compose_gpu.dev.yml up -d --force-recreate ai_module
+```
+
+---
+
+## Explorer mode (coverage tour)
+
+Plans XY standpoints from `/registered_scan` (free-space grid + farthest-point sampling over the **full scanned room**, not an 8 m bubble). The 360° camera already covers all headings at each stop, so the explorer does **not** rotate in place.
+
+After the start snap, the **next stop is the free cell farthest from every snap already taken**. Failed goals are blacklisted. The explorer does **not** throw away the tour and nearest-neighbor replan after every detect (that kept livingroom tours jittering around spawn).
+
+At each stop: settle → `/vlm_live/run_detection` → wait for `/vlm_live/detection_complete` → accumulate with 3D NMS → next uncovered goal.
+
+If the robot wedges (table/cupboard gap), the explorer **backs up ~2.5 m** then republishes the target. It does **not** pull the goal closer — that sat inside the 2 m reach radius and looked “reached” without moving.
+
+A stop within **2.0 m** of the viewpoint counts as reached; detect still runs if you got within ~2.5 m or made ≥1 m of progress. Obstacle inflation for viewpoint free space is **0.30 m** (`free_clearance_m`) with **0.40 m** wall inset. Long rooms can raise the snap budget (`auto_num_viewpoints:=true`, cap 8).
+
+When the tour ends it exports a Pipeline A folder:
+
+`/tmp/vla3d_live/<scene_name>/` (`*_object_result.csv` + `*_scene_graph.json`)
+
+```bash
+ros2 launch vlm_pipeline_live pipeline_b.launch.py \
+  scene_name:=arabic_room \
+  scene_type:=arabic_room \
+  num_viewpoints:=6 \
+  detector_backend:=grounding_dino
+```
+
+Then:
+
+```bash
+ros2 launch vlm_pipeline vlm_pipeline.launch.py \
+  scene_name:=arabic_room \
+  vla3d_data_root:=/tmp/vla3d_live
+```
+
+Planned snaps show as spheres on `/vlm_live/explorer_viewpoints` (green = start).
+
+Useful explorer params: `stuck_backup_m` (2.5), `free_clearance_m` (0.30), `wall_inset_m` (0.40), `max_plan_radius_m` (25), `min_viewpoint_spacing_m` (3.0).
+
+---
+
+## Debugging checklist
+
+1. **Wrong labels / silly boxes on Desktop crops** → tune prompt, thresholds, canonicalize; not LiDAR first.  
+2. **Good boxes, cyan far away** → investigate `lidar_camera_fusion` / sensor frame / projection.  
+3. **Good boxes + cyan OK, bad RViz map boxes** → NMS / accumulate / multi-view duplicates.  
+4. **Good 3D markers, bad robot motion** → Pipeline A standoff / autonomy / traversable area.
+
+---
+
+## Backend A/B/C vs Unity GT (office_2)
+
+Capture three live graphs with the **same teleop viewpoints**, then score them against
+`~/vla3d_data/Unity/office_2/office_2_scene_graph.json` (mounted as `/home/docker/vla3d_data/...`).
+
+### 1. Build
+
+```bash
+cd /home/docker/ai_module
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select vlm_pipeline_live
+source install/setup.bash
+```
+
+### 2. Capture (one launch at a time)
+
+Use identical viewpoints and the same number of `/vlm_live/run_detection` triggers for each.
+
+```bash
+# A) GroundingDINO
+ros2 launch vlm_pipeline_live pipeline_b_manual.launch.py \
+  scene_name:=office_2_dino scene_type:=office \
+  detector_backend:=grounding_dino gemini_verify:=false \
+  save_snapshots:=true
+
+# B) GroundingDINO + Gemini
+ros2 launch vlm_pipeline_live pipeline_b_manual.launch.py \
+  scene_name:=office_2_dino_gemini scene_type:=office \
+  detector_backend:=grounding_dino gemini_verify:=true \
+  gemini_model:=gemini-3.6-flash save_snapshots:=true
+
+# C) YOLOE (YOLO11 open-vocab)
+ros2 launch vlm_pipeline_live pipeline_b_manual.launch.py \
+  scene_name:=office_2_yoloe scene_type:=office \
+  detector_backend:=yoloe gemini_verify:=false \
+  save_snapshots:=true
+```
+
+Each run writes `/tmp/vlm_live_captures/<scene_name>/latest_scene_graph.json`.
+
+### 3. Compare all three vs GT
+
+```bash
+ros2 run vlm_pipeline_live compare_backend_runs -- \
+  --gt /home/docker/vla3d_data/Unity/office_2/office_2_scene_graph.json \
+  --run grounding_dino:/tmp/vlm_live_captures/office_2_dino/latest_scene_graph.json \
+  --run dino_gemini:/tmp/vlm_live_captures/office_2_dino_gemini/latest_scene_graph.json \
+  --run yoloe:/tmp/vlm_live_captures/office_2_yoloe/latest_scene_graph.json \
+  --out /tmp/vlm_backend_compare/office_2_backend_compare.json
+```
+
+Or print the guided script then compare:
+
+```bash
+bash /home/docker/ai_module/src/vlm_pipeline_live/scripts/run_backend_ab_experiment.sh
+```
+
+### GroundingDINO vs OWL-ViT (arabic_room explorer)
+
+Use different `scene_name` values so graphs do not overwrite each other. OWL scores are usually lower than DINO — start at `box_threshold:=0.2`. First OWL run downloads `google/owlv2-base-patch16`.
+
+```bash
+# 1) GroundingDINO
+ros2 launch vlm_pipeline_live pipeline_b.launch.py \
+  scene_name:=arabic_room_dino scene_type:=arabic_room \
+  detector_backend:=grounding_dino box_threshold:=0.35
+
+# 2) OWL-ViT v2
+ros2 launch vlm_pipeline_live pipeline_b.launch.py \
+  scene_name:=arabic_room_owlvit scene_type:=arabic_room \
+  detector_backend:=owlvit box_threshold:=0.2
+
+# 3) Score both vs Unity GT
+ros2 run vlm_pipeline_live compare_backend_runs -- \
+  --gt /home/docker/vla3d_data/Unity/arabic_room/arabic_room_scene_graph.json \
+  --run grounding_dino:/tmp/vlm_live_captures/arabic_room_dino/latest_scene_graph.json \
+  --run owlvit:/tmp/vlm_live_captures/arabic_room_owlvit/latest_scene_graph.json \
+  --out /tmp/arabic_room_dino_vs_owlvit.json
+```
+
+Helper that prints the same commands and compares if both graphs already exist:
+
+```bash
+bash /home/docker/ai_module/src/vlm_pipeline_live/scripts/compare_dino_owlvit.sh
+```
+
+**How to read the table:** higher **matched** + **labP/labR** is better; **extra** high means over-detecting; **meanXY** is mean distance of matched pairs (lower better).
+
+---
+
+## Tests
+
+```bash
+cd /home/docker/ai_module/src/vlm_pipeline_live
+PYTHONPATH=../vlm_pipeline:$PWD:$PYTHONPATH python3 -m unittest \
+  tests.test_label_utils \
+  tests.test_lidar_fusion \
+  tests.test_detection_vis \
+  tests.test_capture_paths \
+  tests.test_compare_scene_graphs \
+  tests.test_live_scene_graph
 ```

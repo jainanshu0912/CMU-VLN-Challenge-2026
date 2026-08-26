@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import threading
 
 import numpy as np
 
@@ -11,29 +11,26 @@ try:
 except ImportError:  # pragma: no cover
   torch = None
 
-
-@dataclass(frozen=True)
-class Detection2D:
-  label: str
-  confidence: float
-  x1: float
-  y1: float
-  x2: float
-  y2: float
-  heading_deg: float
-  crop_width: int
-  crop_height: int
-
-
-DEFAULT_INDOOR_PROMPT = (
-  "chair . sofa . table . pillow . book . lamp . tv . monitor . plant . stool . "
-  "bed . desk . cabinet . shelf . bottle . cup . bowl . window . door . picture . "
-  "clock . keyboard . mouse . laptop . trash can . box . basket . curtain . mirror . "
-  "rug . cushion . vase . candle . remote . phone . plate . jar . bin . ottoman"
+from vlm_pipeline_live.detection_backend import Detection2D
+from vlm_pipeline_live.label_utils import (
+  DEFAULT_INDOOR_PROMPT,
+  HOTEL_PROMPT,
+  OFFICE_PROMPT,
+  canonicalize_label,
+  prompt_for_scene_type,
 )
 
-# Shorter caption for CPU dev runs (4 crops × fewer classes = faster).
-CPU_TEST_PROMPT = "chair . sofa . table . pillow . book . lamp . plant . tv . stool"
+# Re-export for existing imports.
+__all__ = [
+  "DEFAULT_INDOOR_PROMPT",
+  "HOTEL_PROMPT",
+  "OFFICE_PROMPT",
+  "Detection2D",
+  "GroundingDinoBackend",
+  "canonicalize_label",
+  "prompt_for_scene_type",
+  "prompt_from_question",
+]
 
 
 def prompt_from_question(question: str) -> str:
@@ -146,8 +143,20 @@ def _patch_groundingdino_transformers_compat() -> None:
         ),
       )
 
-    with open(bertwarper_path, "w", encoding="utf-8") as fh:
-      fh.write(src)
+    try:
+      with open(bertwarper_path, "w", encoding="utf-8") as fh:
+        fh.write(src)
+    except OSError as exc:
+      # Container user `docker` cannot write site-packages. Shim in memory instead.
+      print(
+        f"[GroundingDINO] Cannot write {bertwarper_path} ({exc}); "
+        "applying transformers 5.x shim in memory.",
+        flush=True,
+      )
+      _patch_bertwarper_in_memory(bertwarper)
+      _sync_bert_model_warper_import(bertwarper)
+      bertwarper._vlm_transformers_patched_v2 = True
+      return
 
   # Reload + rebind so already-imported GroundingDINO sees the new class.
   importlib.reload(bertwarper)
@@ -157,50 +166,96 @@ def _patch_groundingdino_transformers_compat() -> None:
   print("[GroundingDINO] bertwarper.py patched for transformers 5.x.", flush=True)
 
 
+def _patch_bertwarper_in_memory(bertwarper) -> None:
+  """Apply transformers 5.x BertModelWarper shims without rewriting site-packages."""
+  cls = bertwarper.BertModelWarper
+  orig_init = cls.__init__
+  orig_forward = cls.forward
+
+  def init_compat(self, bert_model, *args, **kwargs):
+    if not hasattr(bert_model, "get_head_mask"):
+      bert_model.get_head_mask = None
+    orig_init(self, bert_model, *args, **kwargs)
+    self.get_head_mask = getattr(bert_model, "get_head_mask", None)
+
+  def forward_compat(self, *args, **kwargs):
+    get_ext = self.get_extended_attention_mask
+    get_head = self.get_head_mask
+
+    def get_ext_compat(*a, **k):
+      try:
+        return get_ext(*a, **k)
+      except TypeError:
+        if len(a) >= 3:
+          a = a[:2]
+        k.pop("device", None)
+        return get_ext(*a, **k)
+
+    def get_head_compat(head_mask, num_layers):
+      if get_head is None:
+        return [None] * num_layers
+      return get_head(head_mask, num_layers)
+
+    self.get_extended_attention_mask = get_ext_compat
+    self.get_head_mask = get_head_compat
+    try:
+      return orig_forward(self, *args, **kwargs)
+    finally:
+      self.get_extended_attention_mask = get_ext
+      self.get_head_mask = get_head
+
+  cls.__init__ = init_compat
+  cls.forward = forward_compat
+
+
 def _patch_groundingdino_ms_deform_attn_fallback() -> None:
   """Use PyTorch MSDeformAttn when GroundingDINO CUDA extension ``_C`` is missing.
 
-  Pip installs often ship without the compiled ops. Upstream then still takes the
-  CUDA branch and crashes with ``NameError: _C is not defined``.
+  Pip installs often ship without compiled ops. Upstream then still takes the
+  CUDA branch and crashes with ``NameError: _C is not defined``. The container
+  user cannot rewrite ``/usr/local/lib/.../ms_deform_attn.py``, so this is an
+  in-memory monkey-patch only.
   """
-  import importlib
-  import inspect
-
   import groundingdino.models.GroundingDINO.ms_deform_attn as msda
 
   if getattr(msda, "_vlm_msda_fallback_patched", False):
     return
 
-  path = inspect.getfile(msda)
-  with open(path, encoding="utf-8") as fh:
-    src = fh.read()
+  if getattr(msda, "_C", None) is not None:
+    msda._vlm_msda_fallback_patched = True
+    return
 
-  if "_vlm_msda_fallback" not in src:
-    old = "if torch.cuda.is_available() and value.is_cuda:"
-    new = (
-      "if torch.cuda.is_available() and value.is_cuda "
-      "and globals().get('_C') is not None:  # _vlm_msda_fallback"
-    )
-    if old not in src:
-      print(
-        "[GroundingDINO] ms_deform_attn.py CUDA-branch pattern not found; "
-        "skipping _C fallback patch.",
-        flush=True,
+  pytorch_attn = msda.multi_scale_deformable_attn_pytorch
+  orig_apply = msda.MultiScaleDeformableAttnFunction.apply
+
+  def _apply_with_pytorch_fallback(
+    value,
+    spatial_shapes,
+    level_start_index,
+    sampling_locations,
+    attention_weights,
+    im2col_step,
+  ):
+    if getattr(msda, "_C", None) is None:
+      return pytorch_attn(
+        value, spatial_shapes, sampling_locations, attention_weights
       )
-      msda._vlm_msda_fallback_patched = True
-      return
-    with open(path, "w", encoding="utf-8") as fh:
-      fh.write(src.replace(old, new, 1))
-    print(f"[GroundingDINO] Patched {path} to fall back without _C ops.", flush=True)
+    return orig_apply(
+      value,
+      spatial_shapes,
+      level_start_index,
+      sampling_locations,
+      attention_weights,
+      im2col_step,
+    )
 
-  importlib.reload(msda)
-  # Keep transformer module's imported MSDA class in sync if already loaded.
-  try:
-    import groundingdino.models.GroundingDINO.transformer as transformer
-    transformer.MSDeformAttn = msda.MultiScaleDeformableAttention
-  except Exception:
-    pass
+  msda.MultiScaleDeformableAttnFunction.apply = _apply_with_pytorch_fallback
   msda._vlm_msda_fallback_patched = True
+  print(
+    "[GroundingDINO] CUDA extension _C is missing; using PyTorch MSDeformAttn "
+    "fallback in memory (no site-packages write).",
+    flush=True,
+  )
 
 
 def _patch_groundingdino_runtime() -> None:
@@ -216,28 +271,36 @@ class GroundingDinoBackend:
     self,
     config_path: str,
     checkpoint_path: str,
-    box_threshold: float = 0.3,
+    box_threshold: float = 0.35,
     text_threshold: float = 0.25,
-    device: str = "",
-    force_cpu: bool = False,
+    device: str = "cuda",
   ) -> None:
     self.config_path = config_path
     self.checkpoint_path = checkpoint_path
     self.box_threshold = box_threshold
     self.text_threshold = text_threshold
-    self.force_cpu = force_cpu
-    self.device = device or self._default_device(force_cpu)
+    self.device = (device or "cuda").strip() or "cuda"
     self._model = None
+    self._load_lock = threading.Lock()
     if self.is_available:
       _patch_groundingdino_runtime()
 
+  @property
+  def name(self) -> str:
+    return "grounding_dino"
+
   @staticmethod
-  def _default_device(force_cpu: bool = False) -> str:
-    if force_cpu:
-      return "cpu"
-    if torch is not None and torch.cuda.is_available():
-      return "cuda"
-    return "cpu"
+  def require_cuda(device: str) -> None:
+    if torch is None:
+      raise RuntimeError("PyTorch is required for GroundingDINO (GPU pipeline).")
+    if not device.startswith("cuda"):
+      raise RuntimeError(
+        f"Pipeline B requires a CUDA device (got device={device!r})."
+      )
+    if not torch.cuda.is_available():
+      raise RuntimeError(
+        "CUDA is not available. Install CUDA torch and run inside the GPU container."
+      )
 
   @property
   def is_available(self) -> bool:
@@ -251,38 +314,43 @@ class GroundingDinoBackend:
     if self._model is not None:
       return self._model
 
-    if not self.is_available:
-      raise RuntimeError(
-        "GroundingDINO is not installed. Install torch and GroundingDINO, then set "
-        "model_config_path and model_checkpoint_path parameters."
-      )
+    with self._load_lock:
+      if self._model is not None:
+        return self._model
 
-    print(
-      f"[GroundingDINO] Loading weights from {self.checkpoint_path} on {self.device} "
-      f"(cuda_available={torch.cuda.is_available()})...",
-      flush=True,
-    )
-    if self.device.startswith("cuda") and torch.cuda.is_available():
+      if not self.is_available:
+        raise RuntimeError(
+          "GroundingDINO is not installed. Install torch and GroundingDINO, then set "
+          "model_config_path and model_checkpoint_path parameters."
+        )
+
+      self.require_cuda(self.device)
+
+      print(
+        f"[GroundingDINO] Loading weights from {self.checkpoint_path} on {self.device} "
+        f"(cuda_available={torch.cuda.is_available()})...",
+        flush=True,
+      )
       print(
         f"[GroundingDINO] GPU: {torch.cuda.get_device_name(0)} "
         f"| {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB",
         flush=True,
       )
 
-    _patch_groundingdino_runtime()
+      _patch_groundingdino_runtime()
 
-    from groundingdino.util.inference import load_model
+      from groundingdino.util.inference import load_model
 
-    # Official API defaults to device="cuda"; pass our resolved device explicitly.
-    try:
-      model = load_model(self.config_path, self.checkpoint_path, device=self.device)
-    except TypeError:
-      model = load_model(self.config_path, self.checkpoint_path)
-    model = model.to(self.device)
-    model.eval()
-    self._model = model
-    print(f"[GroundingDINO] Model loaded on {self.device}.", flush=True)
-    return self._model
+      # Official API defaults to device="cuda"; pass our resolved device explicitly.
+      try:
+        model = load_model(self.config_path, self.checkpoint_path, device=self.device)
+      except TypeError:
+        model = load_model(self.config_path, self.checkpoint_path)
+      model = model.to(self.device)
+      model.eval()
+      self._model = model
+      print(f"[GroundingDINO] Model loaded on {self.device}.", flush=True)
+      return self._model
 
   def detect(
     self,
@@ -299,14 +367,8 @@ class GroundingDinoBackend:
 
     model = self._load_model()
     image_tensor = self._preprocess(image_rgb).to(self.device)
-    timing_hint = (
-      "GPU: typically a few seconds per crop"
-      if self.device.startswith("cuda")
-      else "CPU: often 2–8 min per crop"
-    )
     print(
-      f"[GroundingDINO] Inference heading={heading_deg:.0f}° on {self.device} "
-      f"({timing_hint})...",
+      f"[GroundingDINO] Inference heading={heading_deg:.0f}° on {self.device}...",
       flush=True,
     )
 

@@ -13,7 +13,7 @@ class GeminiBackend(VlmBackend):
 
   def __init__(
     self,
-    model: str = "gemini-2.0-flash",
+    model: str = "gemini-3.6-flash",
     api_key: Optional[str] = None,
   ) -> None:
     self._model = model

@@ -10,7 +10,8 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2
 
 from vlm_pipeline_live.equirect_to_perspective import EquirectPerspectiveProjector
-from vlm_pipeline_live.grounding_dino_backend import Detection2D
+from vlm_pipeline_live.detection_backend import Detection2D
+from vlm_pipeline_live.label_utils import canonicalize_label
 
 try:
   from sensor_msgs_py import point_cloud2 as pc2
@@ -18,7 +19,31 @@ except ImportError:  # pragma: no cover
   pc2 = None
 
 
-# ROS sensor frame (x forward, y left, z up) → camera optical (x right, y down, z forward).
+CEILING_LABELS = {
+  "lamp",
+  "lantern",
+  "ceiling",
+  "focus light",
+  "wall lamp",
+  "ceiling lamp",
+}
+
+# Typical max height so wall/ceiling points cannot inflate a chair into a 3 m pillar.
+MAX_Z_LENGTH_M = {
+  "pillow": 0.35,
+  "book": 0.25,
+  "shoes": 0.25,
+  "tray": 0.2,
+  "stool": 0.7,
+  "chair": 1.1,
+  "table": 1.0,
+  "sofa": 1.2,
+  "plant": 1.6,
+  "potted plant": 1.6,
+  "carpet": 0.15,
+  "vase": 0.8,
+  "arabic jar": 0.9,
+}
 DEFAULT_SENSOR_TO_CAMERA = np.array([
   [0.0, -1.0, 0.0],
   [0.0, 0.0, -1.0],
@@ -102,9 +127,80 @@ def map_points_to_camera(
 
 def bbox_from_points(points_map: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
   center = np.median(points_map, axis=0)
-  low = np.percentile(points_map, 5, axis=0)
-  high = np.percentile(points_map, 95, axis=0)
+  low = np.percentile(points_map, 8, axis=0)
+  high = np.percentile(points_map, 92, axis=0)
   size = np.maximum(high - low, 0.08)
+  return center, size
+
+
+def refine_matched_points(
+  matched: np.ndarray,
+  robot_xy: np.ndarray,
+  robot_z: float,
+  label: str,
+  min_points: int,
+) -> np.ndarray:
+  """Drop wall/ceiling outliers so the 3D box sits on the object, not in mid-air."""
+  pts = matched
+  if len(pts) == 0:
+    return pts
+
+  dist = np.linalg.norm(pts[:, :2] - robot_xy.reshape(1, 2), axis=1)
+  if len(pts) >= max(min_points, 12):
+    med_d = float(np.median(dist))
+    keep = np.abs(dist - med_d) <= 0.8
+    if int(np.count_nonzero(keep)) >= min_points:
+      pts = pts[keep]
+      dist = dist[keep]
+
+  canon = canonicalize_label(label)
+  if canon in CEILING_LABELS:
+    zc = float(np.percentile(pts[:, 2], 70))
+    keep_z = np.abs(pts[:, 2] - zc) <= 0.45
+    if int(np.count_nonzero(keep_z)) >= min_points:
+      pts = pts[keep_z]
+    return pts
+
+  zmin = robot_z - 1.05
+  zmax = robot_z + 1.35
+  keep_z = (pts[:, 2] >= zmin) & (pts[:, 2] <= zmax)
+  if int(np.count_nonzero(keep_z)) >= min_points:
+    pts = pts[keep_z]
+  zc = float(np.percentile(pts[:, 2], 30))
+  keep_band = np.abs(pts[:, 2] - zc) <= 0.55
+  if int(np.count_nonzero(keep_band)) >= min_points:
+    pts = pts[keep_band]
+  return pts
+
+
+def sit_box_on_floor(
+  center: np.ndarray,
+  size: np.ndarray,
+  robot_z: float,
+  label: str,
+) -> tuple[np.ndarray, np.ndarray]:
+  """Shift/clamp a furniture box so it is not a floating pillar."""
+  center = np.asarray(center, dtype=np.float64).copy()
+  size = np.asarray(size, dtype=np.float64).copy()
+  canon = canonicalize_label(label)
+  if canon in CEILING_LABELS:
+    size[2] = min(float(size[2]), 0.6)
+    return center, size
+
+  max_h = MAX_Z_LENGTH_M.get(canon, 1.7)
+  size[2] = min(float(size[2]), max_h)
+  size[0] = min(float(size[0]), 3.5)
+  size[1] = min(float(size[1]), 3.5)
+
+  floor_z = robot_z - 0.72
+  bottom = center[2] - size[2] / 2.0
+  # Only pull down boxes that are clearly airborne (not test clouds at z≈0).
+  if bottom > max(floor_z + 0.18, 0.28):
+    center[2] -= bottom - (floor_z + 0.04)
+  bottom = center[2] - size[2] / 2.0
+  if bottom < floor_z - 0.15 and robot_z > 0.3:
+    lift = (floor_z - 0.02) - bottom
+    center[2] += lift
   return center, size
 
 
@@ -162,6 +258,7 @@ class LidarCameraFusion:
     if len(points_map) == 0:
       return []
 
+    robot_z = float(odometry.pose.pose.position.z)
     points_cam = map_points_to_camera(points_map, odometry, self.sensor_to_camera)
     objects: list[DetectedObject3D] = []
 
@@ -178,14 +275,22 @@ class LidarCameraFusion:
         & (py <= det.y2)
       )
       matched = points_map[in_box]
+      matched = refine_matched_points(
+        matched,
+        robot_xy,
+        robot_z,
+        det.label,
+        self.min_lidar_points,
+      )
       if len(matched) < self.min_lidar_points:
         continue
 
       center, size = bbox_from_points(matched)
+      center, size = sit_box_on_floor(center, size, robot_z, det.label)
       objects.append(
         DetectedObject3D(
-          label=det.label,
-          confidence=det.confidence,
+          label=canonicalize_label(det.label),
+          confidence=float(det.confidence),
           cx=float(center[0]),
           cy=float(center[1]),
           cz=float(center[2]),
@@ -201,22 +306,73 @@ class LidarCameraFusion:
     return nms_3d(objects, self.nms_distance_m)
 
 
-def nms_3d(objects: list[DetectedObject3D], distance_m: float) -> list[DetectedObject3D]:
+def _xy_footprint(obj: DetectedObject3D) -> float:
+  return math.hypot(max(obj.x_length, 0.05), max(obj.y_length, 0.05))
+
+
+def _class_aware_merge_radius_m(
+  a: DetectedObject3D,
+  b: DetectedObject3D,
+  base_distance_m: float,
+) -> float:
+  """Larger furniture gets a larger duplicate-merge radius."""
+  scale = 0.55 * max(_xy_footprint(a), _xy_footprint(b))
+  return max(base_distance_m, min(2.5, scale))
+
+
+def _nms_rank(obj: DetectedObject3D) -> tuple[float, int]:
+  # Prefer higher confidence, then denser LiDAR support.
+  return (float(obj.confidence), int(obj.num_lidar_points))
+
+
+def nms_3d(
+  objects: list[DetectedObject3D],
+  distance_m: float,
+  *,
+  class_aware: bool = True,
+) -> list[DetectedObject3D]:
+  """Suppress duplicate 3D boxes.
+
+  When ``class_aware`` is True (default), only boxes with the same canonical
+  label can suppress each other. Merge radius grows with object footprint so
+  large desks/cabinets merge across views more aggressively than cups.
+  """
   if not objects:
     return []
 
+  # Canonicalize again so accumulated maps from older runs still merge.
+  normalized: list[DetectedObject3D] = []
+  for obj in objects:
+    canon = canonicalize_label(obj.label)
+    if canon != obj.label:
+      obj = DetectedObject3D(
+        label=canon,
+        confidence=obj.confidence,
+        cx=obj.cx,
+        cy=obj.cy,
+        cz=obj.cz,
+        x_length=obj.x_length,
+        y_length=obj.y_length,
+        z_length=obj.z_length,
+        heading=obj.heading,
+        num_lidar_points=obj.num_lidar_points,
+        source_heading_deg=obj.source_heading_deg,
+      )
+    normalized.append(obj)
+
   kept: list[DetectedObject3D] = []
-  for candidate in sorted(objects, key=lambda obj: obj.confidence, reverse=True):
+  for candidate in sorted(normalized, key=_nms_rank, reverse=True):
     duplicate = False
     for existing in kept:
-      if candidate.label != existing.label:
+      if class_aware and candidate.label != existing.label:
         continue
       dist = math.hypot(
         candidate.cx - existing.cx,
         candidate.cy - existing.cy,
         candidate.cz - existing.cz,
       )
-      if dist < distance_m:
+      radius = _class_aware_merge_radius_m(candidate, existing, distance_m)
+      if dist < radius:
         duplicate = True
         break
     if not duplicate:

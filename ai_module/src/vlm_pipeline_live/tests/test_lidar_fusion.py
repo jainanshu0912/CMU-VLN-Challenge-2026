@@ -10,12 +10,14 @@ from sensor_msgs.msg import PointCloud2
 from sensor_msgs.msg import PointField
 from std_msgs.msg import Header
 
-from vlm_pipeline_live.grounding_dino_backend import Detection2D
+from vlm_pipeline_live.detection_backend import Detection2D
 from vlm_pipeline_live.lidar_camera_fusion import (
   LidarCameraFusion,
   map_points_to_camera,
   nms_3d,
   odometry_to_map_sensor_transform,
+  refine_matched_points,
+  sit_box_on_floor,
 )
 from vlm_pipeline_live.lidar_camera_fusion import DetectedObject3D
 
@@ -119,6 +121,95 @@ class LidarFusionTests(unittest.TestCase):
     kept = nms_3d([second, first], distance_m=0.5)
     self.assertEqual(len(kept), 1)
     self.assertAlmostEqual(kept[0].confidence, 0.9)
+
+  def test_nms_3d_merges_aliased_labels(self):
+    trash_can = DetectedObject3D(
+      label="trash can",
+      confidence=0.8,
+      cx=1.0,
+      cy=1.0,
+      cz=0.4,
+      x_length=0.3,
+      y_length=0.3,
+      z_length=0.5,
+      heading=0.0,
+      num_lidar_points=20,
+      source_heading_deg=0.0,
+    )
+    trash_bin = DetectedObject3D(
+      label="trash bin",
+      confidence=0.6,
+      cx=1.15,
+      cy=1.0,
+      cz=0.4,
+      x_length=0.3,
+      y_length=0.3,
+      z_length=0.5,
+      heading=0.0,
+      num_lidar_points=12,
+      source_heading_deg=90.0,
+    )
+    kept = nms_3d([trash_bin, trash_can], distance_m=0.5)
+    self.assertEqual(len(kept), 1)
+    self.assertEqual(kept[0].label, "trash can")
+
+  def test_nms_3d_keeps_different_classes(self):
+    chair = DetectedObject3D(
+      label="chair",
+      confidence=0.9,
+      cx=1.0,
+      cy=1.0,
+      cz=0.5,
+      x_length=0.5,
+      y_length=0.5,
+      z_length=0.9,
+      heading=0.0,
+      num_lidar_points=30,
+      source_heading_deg=0.0,
+    )
+    desk = DetectedObject3D(
+      label="desk",
+      confidence=0.9,
+      cx=1.1,
+      cy=1.0,
+      cz=0.5,
+      x_length=1.2,
+      y_length=0.7,
+      z_length=0.8,
+      heading=0.0,
+      num_lidar_points=40,
+      source_heading_deg=0.0,
+    )
+    kept = nms_3d([chair, desk], distance_m=0.5)
+    self.assertEqual(len(kept), 2)
+
+  def test_refine_drops_ceiling_points_for_furniture(self) -> None:
+    robot_xy = np.array([0.0, 0.0])
+    furniture = np.array([
+      [2.0, 0.0, 0.15],
+      [2.05, 0.04, 0.20],
+      [1.95, -0.03, 0.18],
+      [2.02, 0.02, 0.40],
+      [2.0, 0.0, 0.55],
+    ], dtype=np.float64)
+    ceiling = np.array([
+      [2.0, 0.0, 2.6],
+      [2.1, 0.1, 2.7],
+      [1.9, -0.1, 2.5],
+      [2.0, 0.05, 2.55],
+    ], dtype=np.float64)
+    mixed = np.vstack([furniture, ceiling])
+    refined = refine_matched_points(mixed, robot_xy, robot_z=0.75, label="sofa", min_points=3)
+    self.assertGreaterEqual(len(refined), 3)
+    self.assertLess(float(np.median(refined[:, 2])), 1.0)
+
+  def test_sit_box_on_floor_lowers_floating_pillar(self) -> None:
+    center = np.array([2.0, 0.0, 1.8])
+    size = np.array([0.8, 0.6, 2.4])
+    c2, s2 = sit_box_on_floor(center, size, robot_z=0.75, label="table")
+    bottom = c2[2] - s2[2] / 2.0
+    self.assertLess(s2[2], 1.05)
+    self.assertLess(bottom, 0.25)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,19 @@
-# VLM Pipeline (Track A)
+# VLM Pipeline (Track A / Pipeline A)
 
 Zero-shot **find**, **count**, and **instruction-following** pipeline for the [CMU VLN Challenge 2026](https://github.com/jainanshu0912/CMU-VLN-Challenge-2026). It answers challenge questions using pre-loaded VLA-3D scene data (`object_result.csv` + `scene_graph.json`) and a rule-based query parser—no API keys required by default.
+
+> **Live perception is Pipeline B** (`vlm_pipeline_live`). Pipeline A only loads a scene folder and answers questions. To A/B object detectors (GroundingDINO vs YOLO-World), change backends in Pipeline B, export a graph, then point A at that folder.
+
+## What's new (recent changes)
+
+| Change | Why it matters |
+|--------|----------------|
+| **Simple find navigation** | Find publishes one **standoff** waypoint toward the robot (size-aware clearance). Experimental multi-approach / trav-snap paths were dropped — keep autonomy goals easy to reach. |
+| **Waypoint reliability knobs** | Reach dwell, skip-if-within, and no-republish radii reduce autonomy “spin lock” when already near the goal. |
+| **Live graph handoff** | Same `SceneLoader` works on **Pipeline B exports** (`*_object_result.csv` + `*_scene_graph.json`). Wrong labels usually come from B’s 2D backend, not A’s graph search. |
+| **Sample `live_scene`** | Package sample under `vlm_pipeline_live/data/live_scene/` so you can run A on a captured live graph without Unity GT. |
+
+**Not in Pipeline A:** camera/LiDAR detection, GroundingDINO, YOLO-World. Those live in Pipeline B behind `detector_backend:=grounding_dino \| yolo_world`.
 
 ## What it does
 
@@ -64,6 +77,9 @@ Node parameters:
 | `waypoint_reach_dwell_sec` | `0.3` | Must stay inside reach radius this long before advancing |
 | `waypoint_timeout_sec` | `120.0` | Per-leg timeout while following a path |
 | `waypoint_republish_sec` | `2.0` | Re-publish rate while still far from the goal |
+| `stuck_window_sec` | `3.5` | No motion for this long → backup-then-retry |
+| `stuck_backup_m` | `1.2` | Reverse distance before republishing the target |
+| `max_stuck_recoveries` | `3` | Backup attempts per navigate leg |
 
 Example with host data path and larger standoff:
 
@@ -147,6 +163,33 @@ Wait ~2 s after launching the pipeline so DDS discovery completes.
 
 The Unity visual scene and `scene_name` must match for correct answers in simulation.
 
+## Using a live scene graph from Pipeline B
+
+Pipeline A does not run detectors. After Pipeline B builds a graph:
+
+```bash
+# Export live graph → VLA-3D-style folder
+ros2 run vlm_pipeline_live write_object_list_from_scene_graph -- \
+  --graph /tmp/vlm_live_captures/office_2/latest_scene_graph.json \
+  --out-dir /tmp/vla3d_live/live_scene \
+  --scene-name live_scene
+
+# Point Pipeline A at that folder
+ros2 launch vlm_pipeline vlm_pipeline.launch.py \
+  scene_name:=live_scene \
+  vla3d_data_root:=/tmp/vla3d_live
+```
+
+Or use the checked-in sample:
+
+```bash
+ros2 launch vlm_pipeline vlm_pipeline.launch.py \
+  scene_name:=live_scene \
+  vla3d_data_root:=/home/docker/ai_module/src/vlm_pipeline_live/data
+```
+
+If find/count picks the wrong object class, compare Pipeline B backends on the same tour (`detector_backend:=grounding_dino` vs `yolo_world`) before tuning A’s parsers. See `vlm_pipeline_live/README.md` → **Pluggable 2D backends**.
+
 ## Optional LLM query parser
 
 Default is a free rule-based parser. To use an LLM for parsing find/count (still uses graph search for answers):
@@ -182,11 +225,11 @@ vlm_pipeline/
     └── test_offline_navigate.py
 ```
 
-## Limitations (Track A)
+## Limitations (Track A / Pipeline A)
 
-- Static scene graph only—no live camera or LiDAR perception
+- **No onboard perception** — loads CSV + scene graph only (Unity GT or a Pipeline B export)
 - Avoid-path constraints are parsed/logged but not geometrically enforced yet
-- Find/navigate waypoints use a standoff near object centers; cluttered goals may still be hard for the base planner
+- Find/navigate use a **simple standoff** near object centers; cluttered goals may still be hard for the base planner
 - Test-time held-out scenes are not available in the released VLA-3D training set
 
-Track B (live scene graph from sensors) is not included in this package.
+**Pipeline B** (`vlm_pipeline_live`) builds live graphs from camera + LiDAR and supports pluggable 2D backends (GroundingDINO / YOLO-World). Export those graphs into a VLA-3D-style folder and launch Pipeline A as above.

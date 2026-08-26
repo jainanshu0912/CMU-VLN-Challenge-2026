@@ -12,8 +12,8 @@ DEFAULT_BACKENDS: Dict[str, str] = {
   "openai": "gpt-4o",
   "claude": "claude-sonnet-4-20250514",
   "anthropic": "claude-sonnet-4-20250514",
-  "gemini": "gemini-2.0-flash",
-  "google": "gemini-2.0-flash",
+  "gemini": "gemini-3.6-flash",
+  "google": "gemini-3.6-flash",
 }
 
 

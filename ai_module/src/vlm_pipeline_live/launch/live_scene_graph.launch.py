@@ -12,8 +12,14 @@ def generate_launch_description():
   save_arg = DeclareLaunchArgument("save_graph", default_value="true")
   path_arg = DeclareLaunchArgument(
     "graph_output_path",
-    default_value="/tmp/vlm_live_scene_graph.json",
+    default_value="",
+    description="Optional *.json path (timestamp-suffixed). Empty → graph_output_dir layout",
   )
+  dir_arg = DeclareLaunchArgument(
+    "graph_output_dir",
+    default_value="/tmp/vlm_live_captures",
+  )
+  unique_arg = DeclareLaunchArgument("unique_graph_output", default_value="true")
 
   node = Node(
     package="vlm_pipeline_live",
@@ -25,6 +31,8 @@ def generate_launch_description():
       "near_distance_m": LaunchConfiguration("near_distance_m"),
       "save_graph": LaunchConfiguration("save_graph"),
       "graph_output_path": LaunchConfiguration("graph_output_path"),
+      "graph_output_dir": LaunchConfiguration("graph_output_dir"),
+      "unique_graph_output": LaunchConfiguration("unique_graph_output"),
       "auto_run_on_detection_complete": True,
       "shutdown_on_complete": False,
     }],
@@ -35,5 +43,7 @@ def generate_launch_description():
     near_arg,
     save_arg,
     path_arg,
+    dir_arg,
+    unique_arg,
     node,
   ])

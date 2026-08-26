@@ -27,6 +27,7 @@ setup(
     entry_points={
         "console_scripts": [
             "vlm_pipeline_node = vlm_pipeline.main_node:main",
+            "pub_challenge_question = vlm_pipeline.pub_challenge_question:main",
         ],
     },
 )

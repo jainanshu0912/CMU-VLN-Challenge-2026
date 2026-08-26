@@ -1,0 +1,11 @@
+# Build context is ai_module/. Keep weights out of git; build.sh may stage the .pth.
+build/
+install/
+log/
+.cursor/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+yoloe-11s-seg.pt
+mobileclip_blt.ts
+*.pt

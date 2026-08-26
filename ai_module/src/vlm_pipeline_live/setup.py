@@ -17,15 +17,16 @@ setup(
       "launch/live_detector.launch.py",
       "launch/live_scene_graph.launch.py",
       "launch/pipeline_b.launch.py",
-      "launch/pipeline_b_cpu.launch.py",
       "launch/pipeline_b_manual.launch.py",
-      "launch/pipeline_b_manual_cpu.launch.py",
     ]),
     (os.path.join(share_dir, "data", "live_scene"), [
       "data/live_scene/README.md",
       "data/live_scene/live_scene_scene_graph.json",
       "data/live_scene/live_scene_object_result.csv",
       "data/live_scene/object_list.txt",
+    ]),
+    (os.path.join(share_dir, "data", "captured"), [
+      "data/captured/README.md",
     ]),
   ],
   install_requires=["setuptools", "numpy"],
@@ -41,6 +42,9 @@ setup(
       "live_detector_node = vlm_pipeline_live.live_detector:main",
       "live_scene_graph_node = vlm_pipeline_live.live_scene_graph_node:main",
       "write_object_list_from_scene_graph = vlm_pipeline_live.write_object_list_from_scene_graph:main",
+      "archive_captured_scene = vlm_pipeline_live.archive_captured_scene:main",
+      "compare_scene_graphs = vlm_pipeline_live.compare_scene_graphs:main",
+      "compare_backend_runs = vlm_pipeline_live.compare_backend_runs:main",
     ],
   },
 )
