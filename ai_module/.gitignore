@@ -9,3 +9,20 @@ __pycache__/
 docker/models/*.pth
 docker/models/*.ckpt
 mobileclip_blt.ts
+
+# Local-only (kept on disk, not submitted)
+VLN_PIPELINE_PLAN.md
+src/vlm_pipeline/tests/
+src/vlm_pipeline_live/tests/
+src/vlm_sequential/tests/
+src/vlm_pipeline_live/scripts/
+src/vlm_pipeline_live/vlm_pipeline_live/owlvit_backend.py
+src/vlm_pipeline_live/vlm_pipeline_live/yoloe_backend.py
+src/vlm_pipeline_live/vlm_pipeline_live/yolo_world_backend.py
+src/vlm_pipeline_live/vlm_pipeline_live/gemini_label_verifier.py
+src/vlm_pipeline_live/vlm_pipeline_live/compare_scene_graphs.py
+src/vlm_pipeline_live/vlm_pipeline_live/compare_backend_runs.py
+src/vlm_pipeline/vlm_pipeline/vlm_backends/gemini_backend.py
+src/vlm_pipeline/vlm_pipeline/vlm_backends/openai_backend.py
+src/vlm_pipeline/vlm_pipeline/vlm_backends/claude_backend.py
+src/vlm_pipeline/vlm_pipeline/vlm_backends/ollama_backend.py

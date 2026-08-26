@@ -9,7 +9,7 @@ import time
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 import rclpy
@@ -32,7 +32,6 @@ from vlm_pipeline_live.equirect_to_perspective import (
   EquirectPerspectiveProjector,
   ros_image_to_numpy,
 )
-from vlm_pipeline_live.gemini_label_verifier import GeminiLabelVerifier
 from vlm_pipeline_live.grounding_dino_backend import (
   DEFAULT_INDOOR_PROMPT,
   prompt_for_scene_type,
@@ -105,7 +104,7 @@ class LiveDetector:
     detector=None,
     projector: EquirectPerspectiveProjector | None = None,
     fusion: LidarCameraFusion | None = None,
-    verifier: GeminiLabelVerifier | None = None,
+    verifier: Any | None = None,
     default_prompt: str = DEFAULT_INDOOR_PROMPT,
     log_fn: LogFn | None = None,
   ) -> None:
@@ -348,8 +347,10 @@ class LiveDetectorNode(Node):
       self.get_parameter("gemini_api_key").get_parameter_value().string_value.strip()
     )
     gemini_fail_open = self.get_parameter("gemini_fail_open").get_parameter_value().bool_value
-    verifier: GeminiLabelVerifier | None = None
+    verifier: Any | None = None
     if gemini_verify:
+      from vlm_pipeline_live.gemini_label_verifier import GeminiLabelVerifier
+
       verifier = GeminiLabelVerifier(
         model=gemini_model,
         api_key=gemini_api_key or None,

@@ -74,10 +74,16 @@ def create_backend(
 
   Accepted names: ollama, gemini, google, gpt-4o, openai, claude, anthropic.
   """
-  from vlm_pipeline.vlm_backends.claude_backend import ClaudeBackend
-  from vlm_pipeline.vlm_backends.gemini_backend import GeminiBackend
-  from vlm_pipeline.vlm_backends.ollama_backend import OllamaBackend
-  from vlm_pipeline.vlm_backends.openai_backend import OpenAIBackend
+  try:
+    from vlm_pipeline.vlm_backends.claude_backend import ClaudeBackend
+    from vlm_pipeline.vlm_backends.gemini_backend import GeminiBackend
+    from vlm_pipeline.vlm_backends.ollama_backend import OllamaBackend
+    from vlm_pipeline.vlm_backends.openai_backend import OpenAIBackend
+  except ImportError as exc:
+    raise ImportError(
+      "LLM backends are not in this checkout. Leave use_llm_parser:=false "
+      "(the eval default) or restore the local adapter files."
+    ) from exc
 
   normalized = backend_name.strip().lower()
   registry: Dict[str, Type[VlmBackend]] = {
