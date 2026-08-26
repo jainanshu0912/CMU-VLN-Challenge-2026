@@ -20,13 +20,9 @@ setup(
       "launch/pipeline_b_manual.launch.py",
     ]),
     (os.path.join(share_dir, "data", "live_scene"), [
-      "data/live_scene/README.md",
       "data/live_scene/live_scene_scene_graph.json",
       "data/live_scene/live_scene_object_result.csv",
       "data/live_scene/object_list.txt",
-    ]),
-    (os.path.join(share_dir, "data", "captured"), [
-      "data/captured/README.md",
     ]),
   ],
   install_requires=["setuptools", "numpy"],
