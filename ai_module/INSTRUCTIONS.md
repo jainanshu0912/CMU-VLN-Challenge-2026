@@ -10,12 +10,20 @@ That launch **explores the scene, builds a live graph, then answers** `/challeng
 
 ## Extra steps for this entry
 
-1. **GPU compose only.**  
-   `docker compose -f compose_gpu.yml up --build -d`  
-   CPU `compose.yml` cannot run GroundingDINO.
+1. **GPU compose only.** CPU `compose.yml` cannot run GroundingDINO.
 
-2. **First image build is large.**  
-   The AI Dockerfile installs PyTorch (CUDA 12.4), GroundingDINO, and BERT. Leave **~25 GB** free and let `--build` finish. After that, no extra colcon step is needed.
+2. **Prefer the Docker Hub image** (avoids a multi-GB local build):
+
+   [https://hub.docker.com/r/jainanshu0912/cmu-vln-ai-module](https://hub.docker.com/r/jainanshu0912/cmu-vln-ai-module)
+
+   ```bash
+   docker pull jainanshu0912/cmu-vln-ai-module:latest
+   docker tag jainanshu0912/cmu-vln-ai-module:latest docker-ai_module:latest
+   cd docker
+   docker compose -f compose_gpu.yml up -d
+   ```
+
+   Do **not** pass `--build` after pulling. If you must build from this repo instead, use `docker compose -f compose_gpu.yml up --build -d` and leave **~25 GB** free.
 
 3. **Start the system, then click Resume Navigation.**  
    In the system container run `system_simulation.sh`. In RViz, click **Resume Navigation to Goal** (Waypoint mode) so autonomy accepts `/way_point_with_heading`. Then start `dummy_vlm.launch` in `iros2026_ai_module`.

@@ -87,6 +87,8 @@ Launch arguments (optional on `vlm_sequential.launch.py` / `dummy_vlm.launch`):
 
 ## Docker image
 
+Hub: [jainanshu0912/cmu-vln-ai-module](https://hub.docker.com/r/jainanshu0912/cmu-vln-ai-module) (`:latest`). Pull that instead of `--build` when possible (see [INSTRUCTIONS.md](INSTRUCTIONS.md)).
+
 `ai_module/docker/Dockerfile` is self-contained: PyTorch, GroundingDINO, BERT, FastDDS UDP (no shared-memory data sharing), and a colcon build of the four packages. Weights are wget’d if `docker/models/groundingdino_swint_ogc.pth` is not staged.
 
 ```bash
